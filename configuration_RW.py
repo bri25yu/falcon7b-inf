@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ Bloom configuration"""
+"""
+This is a copy of https://huggingface.co/tiiuae/falcon-7b-instruct/raw/main/configuration_RW.py. 
+"""
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
