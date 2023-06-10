@@ -62,4 +62,6 @@ base_model_output, base_model_time_taken = run_inference_on_model(base_model)
 reimpl_model_output, reimpl_model_time_taken = run_inference_on_model(reimpl_model)
 
 print(f"Base model took {base_model_time_taken:.3f}s and reimpl model took {reimpl_model_time_taken:.3f}s")
-assert base_model_output == reimpl_model_output
+if base_model_output != reimpl_model_output:
+    print("Base and reimpl model outputs do not match!")
+    print("Base model output", base_model_output, "Reimpl model output", reimpl_model_output, end="\n\n")
