@@ -5,7 +5,7 @@ from time import time
 from torch import bfloat16
 from torch.nn import Module
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, set_seed
 
 from .modeling_falcon import RWForCausalLM
 
@@ -24,7 +24,7 @@ output_num_tokens = input_num_tokens + max_new_tokens
 print(f"{input_num_tokens} input tokens and {output_num_tokens} output tokens")
 
 
-def run_inference_on_model(model: Module) -> Tuple[str, float]:
+def run_inference_on_model(model: Module, seed: int=42) -> Tuple[str, float]:
     text_generation_pipeline = pipeline(
         "text-generation",
         model=model,
@@ -32,6 +32,7 @@ def run_inference_on_model(model: Module) -> Tuple[str, float]:
         batch_size=1,
     )
 
+    set_seed(seed)
     time_taken = time()
     output_text = text_generation_pipeline(
         input_text,
@@ -64,4 +65,4 @@ reimpl_model_output, reimpl_model_time_taken = run_inference_on_model(reimpl_mod
 print(f"Base model took {base_model_time_taken:.3f}s and reimpl model took {reimpl_model_time_taken:.3f}s")
 if base_model_output != reimpl_model_output:
     print("Base and reimpl model outputs do not match!")
-    print("Base model output", base_model_output, "Reimpl model output", reimpl_model_output, end="\n\n")
+    print("Base model output", base_model_output, "Reimpl model output", reimpl_model_output, sep="\n\n")
