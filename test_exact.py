@@ -1,13 +1,15 @@
-from typing import Tuple
+from typing import Callable
 
 from time import time
+
+from dataclasses import dataclass
 
 from torch import bfloat16
 from torch.nn import Module
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, set_seed
 
-from .modeling_falcon import RWForCausalLM
+from modeling_falcon import RWForCausalLM
 
 
 model_name = "tiiuae/falcon-7b-instruct"
@@ -24,7 +26,18 @@ output_num_tokens = input_num_tokens + max_new_tokens
 print(f"{input_num_tokens} input tokens and {output_num_tokens} output tokens")
 
 
-def run_inference_on_model(model: Module, seed: int=42) -> Tuple[str, float]:
+@dataclass
+class BenchmarkOutput:
+    init_time: float  # secs
+    inference_time: float  # secs
+    output_text: str
+
+
+def run_inference_on_model(model_init: Callable[[], Module], seed: int=42) -> BenchmarkOutput:
+    init_time = time()
+    model = model_init()
+    init_time = time() - init_time
+
     text_generation_pipeline = pipeline(
         "text-generation",
         model=model,
@@ -33,36 +46,55 @@ def run_inference_on_model(model: Module, seed: int=42) -> Tuple[str, float]:
     )
 
     set_seed(seed)
-    time_taken = time()
+    inference_time = time()
     output_text = text_generation_pipeline(
         input_text,
         max_new_tokens=max_new_tokens,
         top_k=10,
         num_return_sequences=1,
     )[0]["generated_text"]
-    time_taken = time() - time_taken
+    inference_time = time() - inference_time
 
-    return output_text, time_taken
+    return BenchmarkOutput(
+        init_time=init_time,
+        inference_time=inference_time,
+        output_text=output_text,
+    )
 
 
-base_model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=bfloat16,
-    trust_remote_code=True,
-    device_map="auto",
+def init_base_model() -> Module:
+    return AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+
+
+def init_reimpl_model() -> Module:
+    return RWForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+    )
+
+base_output = run_inference_on_model(init_base_model)
+reimpl_output = run_inference_on_model(init_reimpl_model)
+
+print(
+    "Init time",
+    f"\tBase model {base_output.init_time:.3f}s",
+    f"\tReimpl model {reimpl_output.init_time:.3f}s",
+    sep="\n",
+)
+print(
+    "Inference time",
+    f"\tBase model {base_output.inference_time:.3f}s",
+    f"\tReimpl model {reimpl_output.inference_time:.3f}s",
+    sep="\n",
 )
 
-reimpl_model = RWForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=bfloat16,
-    trust_remote_code=True,
-    device_map="auto",
-)
-
-base_model_output, base_model_time_taken = run_inference_on_model(base_model)
-reimpl_model_output, reimpl_model_time_taken = run_inference_on_model(reimpl_model)
-
-print(f"Base model took {base_model_time_taken:.3f}s and reimpl model took {reimpl_model_time_taken:.3f}s")
-if base_model_output != reimpl_model_output:
+if base_output.output_text != reimpl_output.output_text:
     print("Base and reimpl model outputs do not match!")
-    print("Base model output", base_model_output, "Reimpl model output", reimpl_model_output, sep="\n\n")
+    print("Base model output", base_output.output_text, "Reimpl model output", reimpl_output.output_text, sep="\n\n")

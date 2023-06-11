@@ -1,211 +1,352 @@
 """
-This is a copy of https://huggingface.co/tiiuae/falcon-7b-instruct/raw/main/modelling_RW.py
-with some changes to improve inference speed. 
+This is a copy of https://huggingface.co/tiiuae/falcon-7b-instruct/blob/main/modelling_RW.py
+with some inference optimizations.
 """
-from typing import Optional, Tuple, Union
-from torchtyping import TensorType
 
-from torch import LongTensor, Tensor, arange, bfloat16, cat, empty, float16, outer
-from torch.utils import checkpoint
-from torch.nn import CrossEntropyLoss, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
-from torch.nn.functional import dropout, scaled_dot_product_attention
-from torch.jit import script
+import math
+import warnings
+from typing import Optional, Tuple, Union
+
+import torch
+import torch.utils.checkpoint
+from torch import nn
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
+from torch.nn import functional as F
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
+    QuestionAnsweringModelOutput,
+    SequenceClassifierOutputWithPast,
+    TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-from configuration_RW import RWConfig
-
+from .configuration_RW import RWConfig
 
 logger = logging.get_logger(__name__)
 
+# NOTE(Hesslow): Unfortunately we did not fuse matmul and bias during training, this means that there's one additional quantization to bfloat16 between the operations.
+# In order not to degrade the quality of our HF-port, we keep these characteristics in the final model.
+class Linear(nn.Linear):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        ret = input @ self.weight.T
+        if self.bias is None:
+            return ret
+        else:
+            return ret + self.bias
 
-NLD = TensorType["N", "L", "D"]
-DD = TensorType["D_out", "D_in"]
-_1LDkv = TensorType["1", "L", "Dkv"]  # Names in Python cannot start with a numeral :(
-L = TensorType["L"]
-HalfDkv = TensorType["Dkv/2"]
-LHalfDkv = TensorType["L", "Dkv/2"]
-LDkv = TensorType["L", "Dkv"]
-NLHDkv = TensorType["N", "L", "H", "Dkv"]
-NHLDkv = TensorType["N", "H", "L", "Dkv"]
+
+# rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=x1.ndim - 1)  # dim=-1 triggers a bug in torch < 1.8.0
 
 
-class Linear(Module):
-    def __init__(self, in_features: int, out_features: int, dtype=None) -> None:
+class RotaryEmbedding(torch.nn.Module):
+    """Implementation of RotaryEmbedding from GPT-NeoX.
+    This implementation is design to operate on queries and keys that are compatible with
+    [batch_size, n_heads_per_partition, seq_len, head_dim] (e.g. MinGPTAttention format).
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        base=10000,
+    ):
         super().__init__()
-
-        # We use empty here to skip one round of parameter initialization
-        # Since this module is only used for inference or finetuning a pretrained model at the moment
-        self.weight: DD = Parameter(empty((out_features, in_features), dtype=dtype))
-
-    def forward(self, input: NLD) -> NLD:
-        """
-        TODO
-        This is from the falcon implementation. Not sure if this is
-        more or less efficient that using the following:
-
-        from torch.nn.functional import linear
-        linear(input, self.weight)
-        """
-        return input @ self.weight.T
-
-
-@script
-def apply_rotary(embeds, cos, sin):
-    # embeds is NLDkv, cos and sin are 1LDkv. output is NLDkv
-    # Handle a possible sequence length mismatch in between q and k
-    L = embeds.size(1)
-    cos = cos[:, :L, :]
-    sin = sin[:, :L, :]
-
-    # left_half and right_half are NLHalfDkv. embeds_half_rotated is NLDkv
-    left_half, right_half = embeds.chunk(2, dim=2)  # In the D dimension
-    embeds_half_rotated = cat((-right_half, left_half), dim=2)
-
-    return embeds * cos + embeds_half_rotated * sin
-
-
-class RotaryEmbedding(Module):
-    def __init__(self, head_dim: int, base: float=10000) -> None:
-        super().__init__()
-
-        inv_freq: HalfDkv = 1.0 / (base ** (arange(0, head_dim, 2).float() / head_dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.head_dim = head_dim
+        self.seq_len_cached = None
+        self.batch_size_cached = None
+        self.cos_cached: torch.Tensor | None = None
+        self.sin_cached: torch.Tensor | None = None
 
-        self.seq_len_cached: Optional[int] = None
-        self.cos_cached: Optional[_1LDkv] = None
-        self.sin_cached: Optional[_1LDkv] = None
-
-    def cos_sin(self, seq_len: int, device="cuda", dtype=bfloat16) -> Tensor:
+    def cos_sin(
+        self,
+        seq_len: int,
+        device="cuda",
+        dtype=torch.bfloat16,
+    ) -> torch.Tensor:
         if seq_len != self.seq_len_cached:
             self.seq_len_cached = seq_len
-            t: L = arange(seq_len, device=device).type_as(self.inv_freq)
+            t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(device)
 
-            freqs: LHalfDkv = outer(t, self.inv_freq)
-            emb: LDkv = cat((freqs, freqs), dim=-1).to(device)
-
-            if dtype in [float16, bfloat16]:
+            if dtype in [torch.float16, torch.bfloat16]:
                 emb = emb.float()
 
-            self.cos_cached: _1LDkv = emb.cos()[None, :, :]
-            self.sin_cached: _1LDkv = emb.sin()[None, :, :]
+            self.cos_cached = emb.cos()[None, :, :]
+            self.sin_cached = emb.sin()[None, :, :]
 
             self.cos_cached = self.cos_cached.type(dtype)
             self.sin_cached = self.sin_cached.type(dtype)
 
         return self.cos_cached, self.sin_cached
 
-    def forward(self, query: NLD, key: NLD) -> Tuple[NLD, NLD]:
-        seq_len = query.size(1)
-        cos, sin = self.cos_sin(seq_len, query.device, query.dtype)
-        return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
+    def forward(self, q, k):
+        batch, seq_len, head_dim = q.shape
+        cos, sin = self.cos_sin(seq_len, q.device, q.dtype)
+        return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
-class Attention(Module):
-    def __init__(self, config: RWConfig) -> None:
+def _make_causal_mask(
+    input_ids_shape: torch.Size, device: torch.device, past_key_values_length: int
+) -> torch.BoolTensor:
+    batch_size, target_length = input_ids_shape
+    mask = torch.empty((target_length, target_length + past_key_values_length), dtype=torch.bool, device=device)
+    # ONNX doesn't support `torch.Tensor.triu` properly, thus we use this workaround
+    seq_ids = torch.arange(target_length, device=device)
+    mask[:, past_key_values_length:] = seq_ids[:, None] < seq_ids[None, :]
+
+    if past_key_values_length > 0:
+        mask[:, :past_key_values_length] = False
+
+    expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
+    return expanded_mask
+
+
+def _expand_mask(mask: torch.Tensor, tgt_length: int) -> torch.BoolTensor:
+    batch_size, src_length = mask.shape
+    tgt_length = tgt_length if tgt_length is not None else src_length
+
+    expanded_mask = ~(mask[:, None, None, :].to(torch.bool))
+    return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
+
+
+def build_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
+    batch_size, seq_length = attention_mask.shape
+    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, device=attention_mask.device, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))), device=attention_mask.device, dtype=torch.float32
+        )
+        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
+        extra_powers = torch.arange(1, 1 + 2 * num_remaining_heads, 2, device=attention_mask.device, dtype=torch.int32)
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+
+    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
+    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
+    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
+    # => the query_length dimension will then be broadcasted correctly
+    # This is more or less identical to T5's relative position bias:
+    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
+    arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
+    alibi = slopes[..., None].bfloat16() * arange_tensor
+    return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
+
+
+def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: bool) -> torch.Tensor:
+    out = F.dropout(x, p=prob, training=training)
+    out = residual + out
+    return out
+
+
+class Attention(nn.Module):
+    def __init__(self, config: RWConfig):
         super().__init__()
 
+        self.hidden_size = config.hidden_size
         self.num_heads = config.n_head
-        self.head_dim = config.hidden_size // self.num_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.split_size = self.hidden_size
+        self.hidden_dropout = config.hidden_dropout
 
-        if self.head_dim * self.num_heads != config.hidden_size:
+        if self.head_dim * self.num_heads != self.hidden_size:
             raise ValueError(
-                f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {config.hidden_size} and `num_heads`:"
+                f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and `num_heads`:"
                 f" {self.num_heads})."
             )
 
-        self.maybe_rotary = RotaryEmbedding(config.head_dim)
+        self.maybe_rotary = RotaryEmbedding(config.head_dim) if config.rotary else lambda q, k: (q, k)
+
+        # Layer-wise attention scaling
+        self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
+        self.beta = self.inv_norm_factor
 
         self.query_key_value = Linear(
-            config.hidden_size,
-            config.hidden_size + 2 * self.head_dim,
-            dtype=config.torch_dtype,
+            self.hidden_size,
+            3 * self.hidden_size if not config.multi_query else (self.hidden_size + 2 * self.head_dim),
+            bias=config.bias,
         )
-        self.dense = Linear(config.hidden_size, config.hidden_size, dtype=config.torch_dtype)
-        self.num_kv = 1
+        self.multi_query = config.multi_query
+        self.dense = Linear(self.hidden_size, self.hidden_size, bias=config.bias)
+        self.attention_dropout = nn.Dropout(config.attention_dropout)
+        self.num_kv = config.n_head if not self.multi_query else 1
+
+    def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
+        storage as `fused_qkv`
+
+        Args:
+            fused_qkv (`torch.tensor`, *required*): [batch_size, seq_length, num_heads * 3 * head_dim]
+
+        Returns:
+            query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
+            value: [batch_size, seq_length, num_heads, head_dim]
+        """
+        if not self.multi_query:
+            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
+            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
+            return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
+        else:
+            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
+            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
+            return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
+
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Merge heads together over the last dimenstion
+
+        Args:
+            x: (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
+
+        Returns:
+            torch.tensor: [batch_size, seq_length, num_heads * head_dim]
+        """
+        # What we want to achieve is:
+        # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
+        batch_size_and_num_heads, seq_length, _ = x.shape
+        batch_size = batch_size_and_num_heads // self.num_heads
+
+        # First view to decompose the batch size
+        # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
+        x = x.view(batch_size, self.num_heads, seq_length, self.head_dim)
+
+        # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
+        x = x.permute(0, 2, 1, 3)
+
+        # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
+        return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
 
     def forward(
         self,
-        hidden_states: NLD,
-        layer_past: Optional[Tuple[Tensor, Tensor]]=None,
-        use_cache: bool=False,
-    ) -> Tuple[NLD, Optional[Tuple[NLD, NLD]]]:
-        N, L, _ = hidden_states.size()
-        H, Dkv, Nkv = self.num_heads, self.head_dim, self.num_kv
+        hidden_states: torch.Tensor,
+        alibi: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+    ):
+        fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
 
-        fused_qkv: NLD = self.query_key_value(hidden_states)
-        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2, Dkv)
+        # 3 x [batch_size, seq_length, num_heads, head_dim]
+        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
 
-        query: NLHDkv = fused_qkv[:, :, :-2, :]
-        key: NLHDkv = fused_qkv[:, :, [-2], :]
-        value: NLHDkv = fused_qkv[:, :, [-1], :]
+        batch_size, q_length, _, _ = query_layer.shape
 
-        def reshape(t: NLHDkv) -> NLD:
-            return t.transpose(1, 2).reshape(-1, L, Dkv)
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        key_layer = key_layer.transpose(1, 2).reshape(
+            batch_size * self.num_kv,
+            q_length,
+            self.head_dim,
+        )
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_kv, q_length, self.head_dim)
 
-        query, key, value = list(map(reshape, (query, key, value)))
-        query, key = self.maybe_rotary(query, key)
+        query_layer, key_layer = self.maybe_rotary(query_layer, key_layer)
 
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
             #  - key: [batch_size * self.num_heads, head_dim, kv_length]
             #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-            # TODO Why is the key not actually concatenated along the seq len
-            key = cat((past_key, key), dim=1)
-            value = cat((past_value, value), dim=1)
+            key_layer = torch.cat((past_key, key_layer), dim=1)
+            value_layer = torch.cat((past_value, value_layer), dim=1)
 
-        present: Tuple[NLD, NLD] = (key, value) if use_cache is True else None
+        _, kv_length, _ = key_layer.shape
 
-        """
-        TODO
-        Sad that we have to do a reshape here. This is because
-        - rotary embeddings input/output shapes. easy fix
-        - kv cache. medium fix
-        """
-        query: NHLDkv = query.reshape(N, H, -1, Dkv)
-        key: NHLDkv = key.reshape(N, Nkv, -1, Dkv)
-        value: NHLDkv = value.reshape(N, Nkv, -1, Dkv)
+        if use_cache is True:
+            present = (key_layer, value_layer)
+        else:
+            present = None
 
-        attn_output: NHLDkv = scaled_dot_product_attention(
-            query, key, value, None, 0.0, is_causal=True
-        )
+        if alibi is None:
+            query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
+            key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+            value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
 
-        attn_output: NHLDkv = attn_output.view(N, H, L, Dkv)
-        attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
-        attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
+            attn_output = F.scaled_dot_product_attention(
+                query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
+            )
 
-        output_tensor: NLD = self.dense(attn_output)
-        return output_tensor, present
+            x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
+            x = x.permute(0, 2, 1, 3)
+            attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
+
+            output_tensor = self.dense(attn_output)
+
+            outputs = (output_tensor, present)
+            assert not output_attentions  # not supported.
+            return outputs
+        else:
+            attention_mask_float = (attention_mask * 1.0).masked_fill(attention_mask, -1e9).to(torch.bfloat16)
+            matmul_result = query_layer @ key_layer.transpose(-1, -2)
+
+            # change view to [batch_size, num_heads, q_length, kv_length]
+            attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
+
+            # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
+            input_dtype = attention_scores.dtype
+            # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
+            if input_dtype == torch.float16 or input_dtype == torch.bfloat16:
+                attention_scores = attention_scores.to(torch.float32)
+            # attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
+            attention_probs = F.softmax(
+                (attention_scores + alibi) * self.inv_norm_factor + attention_mask_float,
+                dim=-1,
+                dtype=hidden_states.dtype,
+            )
+            # [batch_size, num_heads, q_length, kv_length]
+            attention_probs = self.attention_dropout(attention_probs)
+
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+
+            # change view [batch_size x num_heads, q_length, kv_length]
+            attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
+
+            # matmul: [batch_size * num_heads, q_length, head_dim]
+            context_layer = attention_probs_reshaped @ value_layer
+
+            # change view [batch_size, num_heads, q_length, head_dim]
+            context_layer = self._merge_heads(context_layer)
+
+            output_tensor = self.dense(context_layer)
+
+            outputs = (output_tensor, present)
+            if output_attentions:
+                outputs += (attention_probs,)
+
+            return outputs
 
 
-class MLP(Module):
+class MLP(nn.Module):
     def __init__(self, config: RWConfig):
         super().__init__()
         hidden_size = config.hidden_size
 
-        self.dense_h_to_4h = Linear(hidden_size, 4 * hidden_size, dtype=config.torch_dtype)
-        self.act = GELU()
-        self.dense_4h_to_h = Linear(4 * hidden_size, hidden_size, dtype=config.torch_dtype)
+        self.dense_h_to_4h = Linear(hidden_size, 4 * hidden_size, bias=config.bias)
+        self.act = nn.GELU()
+        self.dense_4h_to_h = Linear(4 * hidden_size, hidden_size, bias=config.bias)
         self.hidden_dropout = config.hidden_dropout
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.act(self.dense_h_to_4h(x))
         x = self.dense_4h_to_h(x)
         return x
 
 
-def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
-    out = dropout(x, p=prob, training=training)
-    out = residual + out
-    return out
-
-
-class DecoderLayer(Module):
+class DecoderLayer(nn.Module):
     def __init__(self, config: RWConfig):
         super().__init__()
         hidden_size = config.hidden_size
@@ -227,9 +368,13 @@ class DecoderLayer(Module):
 
     def forward(
         self,
-        hidden_states: Tensor,
-        layer_past: Optional[Tuple[Tensor, Tensor]] = None,
+        hidden_states: torch.Tensor,
+        alibi: torch.Tensor,
+        attention_mask: torch.Tensor,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
+        output_attentions: bool = False,
     ):
 
         layernorm_output = self.input_layernorm(hidden_states)
@@ -239,7 +384,11 @@ class DecoderLayer(Module):
         attn_outputs = self.self_attention(
             layernorm_output,
             layer_past=layer_past,
+            attention_mask=attention_mask,
+            alibi=alibi,
+            head_mask=head_mask,
             use_cache=use_cache,
+            output_attentions=output_attentions,
         )
 
         attention_output = attn_outputs[0]
@@ -281,21 +430,30 @@ class RWPreTrainedModel(PreTrainedModel):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
-    def _init_weights(self, module: Module):
-        """
-        We skip all weight inits since we'll be calling
-        model.load_state_dict() anyways.
-        """
-        return
+    def _init_weights(self, module: nn.Module):
+        """Initialize the weights."""
+        if isinstance(module, nn.Linear) or isinstance(module, Linear):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
-    def _set_gradient_checkpointing(self, module: Module, value: bool = False):
+    def _set_gradient_checkpointing(self, module: nn.Module, value: bool = False):
         if isinstance(module, RWModel):
             module.gradient_checkpointing = value
 
     @staticmethod
     def _convert_to_standard_cache(
-        past_key_value: Tuple[Tuple[Tensor, Tensor]], batch_size: int
-    ) -> Tuple[Tuple[Tensor, Tensor]]:
+        past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]], batch_size: int
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Standardizes the format of the cache so as to match most implementations, i.e. to tuple(tuple([batch_size,
         num_heads, ...]))
@@ -314,8 +472,8 @@ class RWPreTrainedModel(PreTrainedModel):
 
     @staticmethod
     def _convert_to_rw_cache(
-        past_key_value: Tuple[Tuple[Tensor, Tensor]]
-    ) -> Tuple[Tuple[Tensor, Tensor]]:
+        past_key_value: Tuple[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor]]:
         batch_size, num_heads, head_dim, seq_length = past_key_value[0][0].shape
         batch_size_times_num_heads = batch_size * num_heads
         # key:  [batch_size, num_heads, head_dim, seq_length] -> [batch_size * num_heads, head_dim, seq_length]
@@ -335,12 +493,13 @@ class RWModel(RWPreTrainedModel):
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.n_head
+        self.alibi = config.alibi
 
         # Embedding + LN Embedding
-        self.word_embeddings = Embedding(config.vocab_size, self.embed_dim)
+        self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
 
         # Transformer blocks
-        self.h = ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -353,19 +512,55 @@ class RWModel(RWPreTrainedModel):
     def get_input_embeddings(self):
         return self.word_embeddings
 
-    def set_input_embeddings(self, new_embeddings: Tensor):
+    def _prepare_attn_mask(
+        self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
+    ) -> torch.BoolTensor:
+        # create causal mask
+        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        combined_attention_mask = None
+        device = attention_mask.device
+        _, src_length = input_shape
+
+        if src_length > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape, device=device, past_key_values_length=past_key_values_length
+            )
+
+        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
+        combined_attention_mask = (
+            expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
+        )
+
+        return combined_attention_mask
+
+    def set_input_embeddings(self, new_embeddings: torch.Tensor):
         self.word_embeddings = new_embeddings
 
     def forward(
         self,
-        input_ids: Optional[LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
-        inputs_embeds: Optional[LongTensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[Tuple[Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
+        **deprecated_arguments,
+    ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
+        if deprecated_arguments.pop("position_ids", False) is not False:
+            # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
+            warnings.warn(
+                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
+                " passing `position_ids`.",
+                FutureWarning,
+            )
+        if len(deprecated_arguments) > 0:
+            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -384,19 +579,42 @@ class RWModel(RWPreTrainedModel):
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
 
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape batch_size x num_heads x N x N
+        # head_mask has shape n_layer x batch x num_heads x N x N
+        head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
         hidden_states = inputs_embeds
 
         presents = () if use_cache else None
+        all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
+        # Compute alibi tensor: check build_alibi_tensor documentation
         seq_length_with_past = seq_length
         past_key_values_length = 0
         if past_key_values[0] is not None:
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+        else:
+            attention_mask = attention_mask.to(hidden_states.device)
+
+        if self.alibi:
+            alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
+        else:
+            alibi = None
+
+        causal_mask = self._prepare_attn_mask(
+            attention_mask,
+            input_shape=(batch_size, seq_length),
+            past_key_values_length=past_key_values_length,
+        )
 
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
 
@@ -414,24 +632,34 @@ class RWModel(RWPreTrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, use_cache=use_cache)
+                        return module(*inputs, use_cache=use_cache, output_attentions=output_attentions)
 
                     return custom_forward
 
-                outputs = checkpoint(
+                outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
+                    alibi,
+                    causal_mask,
+                    head_mask[i],
                 )
             else:
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
+                    attention_mask=causal_mask,
+                    head_mask=head_mask[i],
                     use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    alibi=alibi,
                 )
 
             hidden_states = outputs[0]
             if use_cache is True:
                 presents = presents + (outputs[1],)
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
@@ -440,12 +668,13 @@ class RWModel(RWPreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, presents, all_hidden_states] if v is not None)
+            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
         )
 
 
@@ -455,7 +684,7 @@ class RWForCausalLM(RWPreTrainedModel):
     def __init__(self, config: RWConfig):
         super().__init__(config)
         self.transformer = RWModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, dtype=config.torch_dtype)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -463,14 +692,14 @@ class RWForCausalLM(RWPreTrainedModel):
     def get_output_embeddings(self):
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings: Tensor):
+    def set_output_embeddings(self, new_embeddings: torch.Tensor):
         self.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: LongTensor,
-        past: Optional[Tensor] = None,
-        attention_mask: Optional[Tensor] = None,
+        input_ids: torch.LongTensor,
+        past: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> dict:
         # only last token for input_ids if past is not None
@@ -485,32 +714,49 @@ class RWForCausalLM(RWPreTrainedModel):
             "input_ids": input_ids,
             "past_key_values": past,
             "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
         }
 
     def forward(
         self,
-        input_ids: Optional[LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
-        inputs_embeds: Optional[Tensor] = None,
-        labels: Optional[Tensor] = None,
+        input_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **kwargs,
-    ) -> Union[Tuple[Tensor], CausalLMOutputWithCrossAttentions]:
+        **deprecated_arguments,
+    ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
-        labels (`LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
+        if deprecated_arguments.pop("position_ids", False) is not False:
+            # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
+            warnings.warn(
+                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
+                " passing `position_ids`.",
+                FutureWarning,
+            )
+        if len(deprecated_arguments) > 0:
+            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
@@ -543,8 +789,8 @@ class RWForCausalLM(RWPreTrainedModel):
         )
 
     def _reorder_cache(
-        self, past: Tuple[Tuple[Tensor, Tensor], ...], beam_idx: LongTensor
-    ) -> Tuple[Tuple[Tensor, Tensor], ...]:
+        self, past: Tuple[Tuple[torch.Tensor, torch.Tensor], ...], beam_idx: torch.LongTensor
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
         """
         This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
         [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
