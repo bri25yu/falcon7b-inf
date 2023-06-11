@@ -53,13 +53,6 @@ def apply_rotary(embeds, cos, sin):
     return embeds * cos + embeds_half_rotated * sin
 
 
-def rotate_half(embeds):
-    # embeds is NHLDkv and output is NHLDkv
-    halfDkv = embeds.size(3) // 2
-    left_half, right_half = embeds[:, :, :, :halfDkv], embeds[:, :, :, halfDkv:]
-    return cat((-right_half, left_half), dim=3)
-
-
 class RotaryEmbedding(Module):
     def __init__(self, config: RWConfig, base: float=10000) -> None:
         super().__init__()
@@ -106,10 +99,7 @@ class RotaryEmbedding(Module):
             cos = cos[:, :, :L, :]
             sin = sin[:, :, :L, :]
 
-        # return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
-        query = query * cos + rotate_half(query) * sin
-        key = key * cos + rotate_half(key) * sin
-        return query, key
+        return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
 
 
 class Attention(Module):
@@ -139,8 +129,6 @@ class Attention(Module):
 
         if layer_past is not None:
             using_past_key_values = True
-            past_key: NHLDkv
-            past_value: NHLDkv
             past_key, past_value = layer_past
             past_key_value_length = past_key.size(2)
         else:
