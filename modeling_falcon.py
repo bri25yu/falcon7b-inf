@@ -4,14 +4,13 @@ with some inference optimizations.
 """
 
 import math
-import warnings
 from typing import Optional, Tuple, Union
 from torchtyping import TensorType
 
 from torch.utils.checkpoint import checkpoint
-from torch import BoolTensor, LongTensor, Tensor, arange, bfloat16, bool as torch_bool, cat, dtype as torch_dtype, einsum, empty, float16, float32, int32, ones, pow
+from torch import LongTensor, Tensor, arange, bfloat16, cat, dtype as torch_dtype, einsum, empty, float16
 from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
-from torch.nn.functional import dropout, scaled_dot_product_attention, softmax, linear
+from torch.nn.functional import dropout, scaled_dot_product_attention, linear
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -88,30 +87,6 @@ class RotaryEmbedding(Module):
         batch, seq_len, head_dim = q.shape
         cos, sin = self.cos_sin(seq_len, q.device, q.dtype)
         return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
-
-
-def _make_causal_mask(
-    input_ids_shape, device, past_key_values_length: int
-) -> BoolTensor:
-    batch_size, target_length = input_ids_shape
-    mask = empty((target_length, target_length + past_key_values_length), dtype=torch_bool, device=device)
-    # ONNX doesn't support `Tensor.triu` properly, thus we use this workaround
-    seq_ids = arange(target_length, device=device)
-    mask[:, past_key_values_length:] = seq_ids[:, None] < seq_ids[None, :]
-
-    if past_key_values_length > 0:
-        mask[:, :past_key_values_length] = False
-
-    expanded_mask = mask[None, None, :, :].expand(batch_size, 1, target_length, target_length + past_key_values_length)
-    return expanded_mask
-
-
-def _expand_mask(mask: Tensor, tgt_length: int) -> BoolTensor:
-    batch_size, src_length = mask.shape
-    tgt_length = tgt_length if tgt_length is not None else src_length
-
-    expanded_mask = ~(mask[:, None, None, :].to(torch_bool))
-    return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
 
 
 def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
@@ -201,7 +176,6 @@ class Attention(Module):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
@@ -295,7 +269,6 @@ class DecoderLayer(Module):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
@@ -309,7 +282,6 @@ class DecoderLayer(Module):
         attn_outputs = self.self_attention(
             layernorm_output,
             layer_past=layer_past,
-            attention_mask=attention_mask,
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -431,28 +403,6 @@ class RWModel(RWPreTrainedModel):
     def get_input_embeddings(self):
         return self.word_embeddings
 
-    def _prepare_attn_mask(
-        self, attention_mask: Tensor, input_shape: Tuple[int, int], past_key_values_length: int
-    ) -> BoolTensor:
-        # create causal mask
-        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
-        combined_attention_mask = None
-        device = attention_mask.device
-        _, src_length = input_shape
-
-        if src_length > 1:
-            combined_attention_mask = _make_causal_mask(
-                input_shape, device=device, past_key_values_length=past_key_values_length
-            )
-
-        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
-        expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
-        combined_attention_mask = (
-            expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
-        )
-
-        return combined_attention_mask
-
     def set_input_embeddings(self, new_embeddings: Tensor):
         self.word_embeddings = new_embeddings
 
@@ -460,7 +410,6 @@ class RWModel(RWPreTrainedModel):
         self,
         input_ids: Optional[LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
-        attention_mask: Optional[Tensor] = None,
         head_mask: Optional[LongTensor] = None,
         inputs_embeds: Optional[LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -469,16 +418,6 @@ class RWModel(RWPreTrainedModel):
         return_dict: Optional[bool] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
-        if deprecated_arguments.pop("position_ids", False) is not False:
-            # `position_ids` could have been `Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
-            warnings.warn(
-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
-                " passing `position_ids`.",
-                FutureWarning,
-            )
-        if len(deprecated_arguments) > 0:
-            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -513,22 +452,6 @@ class RWModel(RWPreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
-        if past_key_values[0] is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
-        if attention_mask is None:
-            attention_mask = ones((batch_size, seq_length_with_past), device=hidden_states.device)
-        else:
-            attention_mask = attention_mask.to(hidden_states.device)
-
-        causal_mask = self._prepare_attn_mask(
-            attention_mask,
-            input_shape=(batch_size, seq_length),
-            past_key_values_length=past_key_values_length,
-        )
-
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
 
             if output_hidden_states:
@@ -552,14 +475,12 @@ class RWModel(RWPreTrainedModel):
                 outputs = checkpoint(
                     create_custom_forward(block),
                     hidden_states,
-                    causal_mask,
                     head_mask[i],
                 )
             else:
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
-                    attention_mask=causal_mask,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
                     output_attentions=output_attentions,
@@ -610,7 +531,7 @@ class RWForCausalLM(RWPreTrainedModel):
         self,
         input_ids: LongTensor,
         past: Optional[Tensor] = None,
-        attention_mask: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,  # Unused
         **kwargs,
     ) -> dict:
         # only last token for input_ids if past is not None
@@ -625,14 +546,12 @@ class RWForCausalLM(RWPreTrainedModel):
             "input_ids": input_ids,
             "past_key_values": past,
             "use_cache": kwargs.get("use_cache"),
-            "attention_mask": attention_mask,
         }
 
     def forward(
         self,
         input_ids: Optional[LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
-        attention_mask: Optional[Tensor] = None,
         head_mask: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
@@ -648,22 +567,11 @@ class RWForCausalLM(RWPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
-        if deprecated_arguments.pop("position_ids", False) is not False:
-            # `position_ids` could have been `Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
-            warnings.warn(
-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
-                " passing `position_ids`.",
-                FutureWarning,
-            )
-        if len(deprecated_arguments) > 0:
-            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
-            attention_mask=attention_mask,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
