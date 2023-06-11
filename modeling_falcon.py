@@ -114,34 +114,6 @@ def _expand_mask(mask: Tensor, tgt_length: int) -> BoolTensor:
     return expanded_mask.expand(batch_size, 1, tgt_length, src_length)
 
 
-def build_alibi_tensor(attention_mask: Tensor, num_heads: int, dtype) -> Tensor:
-    batch_size, seq_length = attention_mask.shape
-    closest_power_of_2 = 2 ** math.floor(math.log2(num_heads))
-    base = Tensor(
-        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))), device=attention_mask.device, dtype=float32
-    )
-    powers = arange(1, 1 + closest_power_of_2, device=attention_mask.device, dtype=int32)
-    slopes = pow(base, powers)
-
-    if closest_power_of_2 != num_heads:
-        extra_base = Tensor(
-            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))), device=attention_mask.device, dtype=float32
-        )
-        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
-        extra_powers = arange(1, 1 + 2 * num_remaining_heads, 2, device=attention_mask.device, dtype=int32)
-        slopes = cat([slopes, pow(extra_base, extra_powers)], dim=0)
-
-    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
-    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
-    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
-    # => the query_length dimension will then be broadcasted correctly
-    # This is more or less identical to T5's relative position bias:
-    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
-    arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
-    alibi = slopes[..., None].bfloat16() * arange_tensor
-    return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
-
-
 def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
     out = dropout(x, p=prob, training=training)
     out = residual + out
@@ -229,7 +201,6 @@ class Attention(Module):
     def forward(
         self,
         hidden_states: Tensor,
-        alibi: Tensor,
         attention_mask: Tensor,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
@@ -261,71 +232,28 @@ class Attention(Module):
             key_layer = cat((past_key, key_layer), dim=1)
             value_layer = cat((past_value, value_layer), dim=1)
 
-        _, kv_length, _ = key_layer.shape
-
         if use_cache is True:
             present = (key_layer, value_layer)
         else:
             present = None
 
-        if alibi is None:
-            query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
-            key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-            value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
+        key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
 
-            attn_output = scaled_dot_product_attention(
-                query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
-            )
+        attn_output = scaled_dot_product_attention(
+            query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
+        )
 
-            x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
-            x = x.permute(0, 2, 1, 3)
-            attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
+        x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
+        x = x.permute(0, 2, 1, 3)
+        attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
 
-            output_tensor = self.dense(attn_output)
+        output_tensor = self.dense(attn_output)
 
-            outputs = (output_tensor, present)
-            assert not output_attentions  # not supported.
-            return outputs
-        else:
-            attention_mask_float = (attention_mask * 1.0).masked_fill(attention_mask, -1e9).to(bfloat16)
-            matmul_result = query_layer @ key_layer.transpose(-1, -2)
-
-            # change view to [batch_size, num_heads, q_length, kv_length]
-            attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
-
-            # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
-            input_dtype = attention_scores.dtype
-            # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
-            if input_dtype == float16 or input_dtype == bfloat16:
-                attention_scores = attention_scores.to(float32)
-            # attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
-            attention_probs = softmax(
-                (attention_scores + alibi) * self.inv_norm_factor + attention_mask_float,
-                dim=-1,
-                dtype=hidden_states.dtype,
-            )
-            # [batch_size, num_heads, q_length, kv_length]
-            attention_probs = self.attention_dropout(attention_probs)
-
-            if head_mask is not None:
-                attention_probs = attention_probs * head_mask
-
-            # change view [batch_size x num_heads, q_length, kv_length]
-            attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
-
-            # matmul: [batch_size * num_heads, q_length, head_dim]
-            context_layer = attention_probs_reshaped @ value_layer
-
-            # change view [batch_size, num_heads, q_length, head_dim]
-            context_layer = self._merge_heads(context_layer)
-
-            output_tensor = self.dense(context_layer)
-
-            outputs = (output_tensor, present)
-            if output_attentions:
-                outputs += (attention_probs,)
-
-            return outputs
+        outputs = (output_tensor, present)
+        assert not output_attentions  # not supported.
+        return outputs
 
 
 class MLP(Module):
@@ -367,7 +295,6 @@ class DecoderLayer(Module):
     def forward(
         self,
         hidden_states: Tensor,
-        alibi: Tensor,
         attention_mask: Tensor,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
@@ -383,7 +310,6 @@ class DecoderLayer(Module):
             layernorm_output,
             layer_past=layer_past,
             attention_mask=attention_mask,
-            alibi=alibi,
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -487,7 +413,6 @@ class RWModel(RWPreTrainedModel):
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.n_head
-        self.alibi = config.alibi
 
         # Embedding + LN Embedding
         self.word_embeddings = Embedding(config.vocab_size, self.embed_dim)
@@ -588,7 +513,6 @@ class RWModel(RWPreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        # Compute alibi tensor: check build_alibi_tensor documentation
         seq_length_with_past = seq_length
         past_key_values_length = 0
         if past_key_values[0] is not None:
@@ -598,11 +522,6 @@ class RWModel(RWPreTrainedModel):
             attention_mask = ones((batch_size, seq_length_with_past), device=hidden_states.device)
         else:
             attention_mask = attention_mask.to(hidden_states.device)
-
-        if self.alibi:
-            alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
-        else:
-            alibi = None
 
         causal_mask = self._prepare_attn_mask(
             attention_mask,
@@ -633,7 +552,6 @@ class RWModel(RWPreTrainedModel):
                 outputs = checkpoint(
                     create_custom_forward(block),
                     hidden_states,
-                    alibi,
                     causal_mask,
                     head_mask[i],
                 )
@@ -645,7 +563,6 @@ class RWModel(RWPreTrainedModel):
                     head_mask=head_mask[i],
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                    alibi=alibi,
                 )
 
             hidden_states = outputs[0]
