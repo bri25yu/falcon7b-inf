@@ -88,7 +88,7 @@ class RotaryEmbedding(Module):
 
     def forward(self, query: NHLDkv, key: NHLDkv, past_key_value_length: Optional[int]=None) -> Tuple[NHLDkv, NHLDkv]:
         L = key.size(2) + (past_key_value_length if past_key_value_length is not None else 0)
-        self.initialize_cos_sin(L, key.device, key.dtype)
+        self.initialize_cos_sin(L, query.dtype)
         self.move_cos_sin_devices(query.device)
 
         cos, sin = self.cos_cached, self.sin_cached
