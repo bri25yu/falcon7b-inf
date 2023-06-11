@@ -7,7 +7,7 @@ from torchtyping import TensorType
 
 from torch.utils.checkpoint import checkpoint
 from torch import LongTensor, Tensor, arange, bfloat16, cat, device as torch_device, dtype as torch_dtype, empty, float16, outer
-from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
+from torch.nn import CrossEntropyLoss, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
 from torch.nn.functional import dropout, scaled_dot_product_attention, linear
 
 from transformers.modeling_outputs import (
@@ -28,6 +28,8 @@ LDkv = TensorType["L", "Dkv"]
 DD = TensorType["Dout", "Din"]
 NLD = TensorType["N", "L", "D"]
 _1LDkv = TensorType["1", "L", "Dkv"]
+NHLDkv = TensorType["N", "H", "L", "Dkv"]
+NLHDkv = TensorType["N", "L", "H", "Dkv"]
 
 
 # Skip weight init since we are only run finetuning or inference
@@ -95,126 +97,64 @@ class Attention(Module):
     def __init__(self, config: RWConfig):
         super().__init__()
 
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.n_head
-        self.head_dim = self.hidden_size // self.num_heads
-        self.split_size = self.hidden_size
-        self.hidden_dropout = config.hidden_dropout
+        D = config.hidden_size
+        H = self.H = config.n_head
+        Dkv = self.Dkv = D // H
+        Nkv = self.Nkv = 1
 
-        if self.head_dim * self.num_heads != self.hidden_size:
-            raise ValueError(
-                f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and `num_heads`:"
-                f" {self.num_heads})."
-            )
+        if Dkv * H != D:
+            raise ValueError(f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {D} and `num_heads`: {H}).")
 
-        self.maybe_rotary = RotaryEmbedding(config.head_dim) if config.rotary else lambda q, k: (q, k)
-
-        self.query_key_value = Linear(
-            self.hidden_size,
-            3 * self.hidden_size if not config.multi_query else (self.hidden_size + 2 * self.head_dim),
-            dtype=config.torch_dtype,
-        )
-        self.multi_query = config.multi_query
-        self.dense = Linear(self.hidden_size, self.hidden_size, dtype=config.torch_dtype)
-        self.attention_dropout = Dropout(config.attention_dropout)
-        self.num_kv = config.n_head if not self.multi_query else 1
-
-    def _split_heads(self, fused_qkv: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
-        storage as `fused_qkv`
-
-        Args:
-            fused_qkv (`Tensor`, *required*): [batch_size, seq_length, num_heads * 3 * head_dim]
-
-        Returns:
-            query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
-            value: [batch_size, seq_length, num_heads, head_dim]
-        """
-        if not self.multi_query:
-            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
-            return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
-        else:
-            batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
-            fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
-            return fused_qkv[..., :-2, :], fused_qkv[..., [-2], :], fused_qkv[..., [-1], :]
-
-    def _merge_heads(self, x: Tensor) -> Tensor:
-        """
-        Merge heads together over the last dimenstion
-
-        Args:
-            x: (`Tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
-
-        Returns:
-            Tensor: [batch_size, seq_length, num_heads * head_dim]
-        """
-        # What we want to achieve is:
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
-        batch_size_and_num_heads, seq_length, _ = x.shape
-        batch_size = batch_size_and_num_heads // self.num_heads
-
-        # First view to decompose the batch size
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
-        x = x.view(batch_size, self.num_heads, seq_length, self.head_dim)
-
-        # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
-        x = x.permute(0, 2, 1, 3)
-
-        # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
-        return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
+        self.maybe_rotary = RotaryEmbedding(Dkv)
+        self.query_key_value = Linear(D, D + Nkv * Dkv, dtype=config.torch_dtype)
+        self.dense: DD = Linear(D, D, dtype=config.torch_dtype)
 
     def forward(
         self,
-        hidden_states: Tensor,
+        hidden_states: NLD,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
-    ):
-        fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+    ) -> Tuple[NLD, Tuple[NLD, NLD]]:
+        Dkv, Nkv, H = self.Dkv, self.Nkv, self.H
+        N, L, _ = hidden_states.size()
 
-        # 3 x [batch_size, seq_length, num_heads, head_dim]
-        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
+        fused_qkv: NLD = self.query_key_value(hidden_states)
+        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + Nkv, Dkv)
+        query: NLHDkv = fused_qkv[:, :, :-2, :]
+        key: NLHDkv = fused_qkv[:, :, [-2], :]
+        value: NLHDkv = fused_qkv[:, :, [-1], :]
 
-        batch_size, q_length, _, _ = query_layer.shape
+        query: NLD = query.transpose(1, 2).reshape(N * H, L, Dkv)
+        key: NLD = key.transpose(1, 2).reshape(N * Nkv, L, Dkv)
+        value: NLD = value.transpose(1, 2).reshape(N * Nkv, L, Dkv)
 
-        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
-        key_layer = key_layer.transpose(1, 2).reshape(
-            batch_size * self.num_kv,
-            q_length,
-            self.head_dim,
-        )
-        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_kv, q_length, self.head_dim)
-
-        query_layer, key_layer = self.maybe_rotary(query_layer, key_layer)
+        query, key = self.maybe_rotary(query, key)
 
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
             #  - key: [batch_size * self.num_heads, head_dim, kv_length]
             #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-            key_layer = cat((past_key, key_layer), dim=1)
-            value_layer = cat((past_value, value_layer), dim=1)
+            key = cat((past_key, key), dim=1)
+            value = cat((past_value, value), dim=1)
+            print(key.size(), value.size())
 
-        if use_cache is True:
-            present = (key_layer, value_layer)
-        else:
-            present = None
+        present: Tuple[NLD, NLD] = (key, value) if use_cache is True else None
 
-        query_layer_ = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
-        key_layer_ = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-        value_layer_ = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        query: NHLDkv = query.reshape(N, H, -1, Dkv)
+        key: NHLDkv = key.reshape(N, Nkv, -1, Dkv)
+        value: NHLDkv = value.reshape(N, Nkv, -1, Dkv)
 
-        attn_output = scaled_dot_product_attention(
-            query_layer_, key_layer_, value_layer_, None, 0.0, is_causal=True
+        attn_output: NHLDkv = scaled_dot_product_attention(
+            query, key, value, None, 0.0, is_causal=True
         )
 
-        x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
-        x = x.permute(0, 2, 1, 3)
-        attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
+        attn_output: NHLDkv = attn_output.view(N, H, L, Dkv)
+        attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
+        attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
 
-        output_tensor = self.dense(attn_output)
+        output_tensor: NLD = self.dense(attn_output)
         return output_tensor, present
 
 
