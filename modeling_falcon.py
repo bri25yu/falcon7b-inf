@@ -5,11 +5,9 @@ with some changes to improve inference speed.
 from typing import Optional, Tuple, Union
 from torchtyping import TensorType
 
-import warnings
-
 from torch import LongTensor, Tensor, arange, bfloat16, cat, empty, float16, outer
 from torch.utils import checkpoint
-from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
+from torch.nn import CrossEntropyLoss, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
 from torch.nn.functional import dropout, scaled_dot_product_attention
 from torch.jit import script
 
@@ -130,61 +128,27 @@ class Attention(Module):
         self.dense = Linear(config.hidden_size, config.hidden_size, dtype=config.torch_dtype)
         self.num_kv = 1
 
-    def _split_heads(self, fused_qkv: NLD) -> Tuple[NLD, NLD, NLD]:
-        batch_size, seq_length, _ = fused_qkv.shape
-        fused_qkv: NLHDkv = fused_qkv.view(batch_size, seq_length, self.num_heads + 2, self.head_dim)
-
-        query: NLHDkv = fused_qkv[:, :, :-2, :]
-        key: NLHDkv = fused_qkv[..., [-2], :]
-        value: NLHDkv = fused_qkv[..., [-1], :]
-
-        def reshape(t: NLHDkv) -> NLD:
-            return t.transpose(1, 2).reshape(-1, seq_length, self.head_dim)
-
-        query: NLD = reshape(query)
-        key: NLD = reshape(key)
-        value: NLD = reshape(value)
-
-        return query, key, value
-
-    def _merge_heads(self, x: Tensor) -> Tensor:
-        """
-        Merge heads together over the last dimenstion
-
-        Args:
-            x: (`Tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
-
-        Returns:
-            Tensor: [batch_size, seq_length, num_heads * head_dim]
-        """
-        # What we want to achieve is:
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
-        batch_size_and_num_heads, seq_length, _ = x.shape
-        batch_size = batch_size_and_num_heads // self.num_heads
-
-        # First view to decompose the batch size
-        # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
-        x = x.view(batch_size, self.num_heads, seq_length, self.head_dim)
-
-        # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
-        x = x.permute(0, 2, 1, 3)
-
-        # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
-        return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
-
     def forward(
         self,
-        hidden_states: Tensor,
-        layer_past: Optional[Tuple[Tensor, Tensor]] = None,
-        use_cache: bool = False,
-    ):
+        hidden_states: NLD,
+        layer_past: Optional[Tuple[Tensor, Tensor]]=None,
+        use_cache: bool=False,
+    ) -> Tuple[NLD, Optional[Tuple[NLD, NLD]]]:
+        N, L, _ = hidden_states.size()
+        H, Dkv, Nkv = self.num_heads, self.head_dim, self.num_kv
+
         fused_qkv: NLD = self.query_key_value(hidden_states)
+        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2, Dkv)
 
-        # Layers are NLD
-        query_layer, key_layer, value_layer = self._split_heads(fused_qkv)
-        query_layer, key_layer = self.maybe_rotary(query_layer, key_layer)
+        query: NLHDkv = fused_qkv[:, :, :-2, :]
+        key: NLHDkv = fused_qkv[:, :, [-2], :]
+        value: NLHDkv = fused_qkv[:, :, [-1], :]
 
-        batch_size, q_length, _ = query_layer.shape
+        def reshape(t: NLHDkv) -> NLD:
+            return t.transpose(1, 2).reshape(-1, L, Dkv)
+
+        query, key, value = list(map(reshape, (query, key, value)))
+        query, key = self.maybe_rotary(query, key)
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -192,10 +156,10 @@ class Attention(Module):
             #  - key: [batch_size * self.num_heads, head_dim, kv_length]
             #  - value: [batch_size * self.num_heads, kv_length, head_dim]
             # TODO Why is the key not actually concatenated along the seq len
-            key_layer = cat((past_key, key_layer), dim=1)
-            value_layer = cat((past_value, value_layer), dim=1)
+            key = cat((past_key, key), dim=1)
+            value = cat((past_value, value), dim=1)
 
-        present = (key_layer, value_layer) if use_cache is True else None
+        present: Tuple[NLD, NLD] = (key, value) if use_cache is True else None
 
         """
         TODO
@@ -203,19 +167,19 @@ class Attention(Module):
         - rotary embeddings input/output shapes. easy fix
         - kv cache. medium fix
         """
-        query_layer = query_layer.reshape(batch_size, self.num_heads, -1, self.head_dim)
-        key_layer = key_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
-        value_layer = value_layer.reshape(batch_size, self.num_kv, -1, self.head_dim)
+        query: NHLDkv = query.reshape(N, H, -1, Dkv)
+        key: NHLDkv = key.reshape(N, Nkv, -1, Dkv)
+        value: NHLDkv = value.reshape(N, Nkv, -1, Dkv)
 
-        attn_output = scaled_dot_product_attention(
-            query_layer, key_layer, value_layer, None, 0.0, is_causal=True
+        attn_output: NHLDkv = scaled_dot_product_attention(
+            query, key, value, None, 0.0, is_causal=True
         )
 
-        x = attn_output.view(batch_size, self.num_heads, q_length, self.head_dim)
-        x = x.permute(0, 2, 1, 3)
-        attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
+        attn_output: NHLDkv = attn_output.view(N, H, L, Dkv)
+        attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
+        attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
 
-        output_tensor = self.dense(attn_output)
+        output_tensor: NLD = self.dense(attn_output)
         return output_tensor, present
 
 
@@ -402,13 +366,6 @@ class RWModel(RWPreTrainedModel):
         return_dict: Optional[bool] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
-        if deprecated_arguments.pop("position_ids", False) is not False:
-            # `position_ids` could have been `Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
-            warnings.warn(
-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
-                " passing `position_ids`.",
-                FutureWarning,
-            )
         if len(deprecated_arguments) > 0:
             raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
 
@@ -516,6 +473,7 @@ class RWForCausalLM(RWPreTrainedModel):
         self,
         input_ids: LongTensor,
         past: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> dict:
         # only last token for input_ids if past is not None
@@ -549,13 +507,6 @@ class RWForCausalLM(RWPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
-        if deprecated_arguments.pop("position_ids", False) is not False:
-            # `position_ids` could have been `Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
-            warnings.warn(
-                "`position_ids` have no functionality in BLOOM and will be removed in v5.0.0. You can safely ignore"
-                " passing `position_ids`.",
-                FutureWarning,
-            )
         if len(deprecated_arguments) > 0:
             raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
 
