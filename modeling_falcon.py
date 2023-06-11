@@ -63,7 +63,7 @@ def apply_rotary(embeds, cos, sin):
     sin = sin[:, :L, :]
 
     # left_half and right_half are NLHalfDkv. embeds_half_rotated is NLDkv
-    left_half, right_half = embeds.chunk(2, dim=3)  # In the D dimension
+    left_half, right_half = embeds.chunk(2, dim=2)  # In the D dimension
     embeds_half_rotated = cat((-right_half, left_half), dim=3)
 
     return embeds * cos + embeds_half_rotated * sin
