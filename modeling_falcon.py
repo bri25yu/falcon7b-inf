@@ -6,10 +6,11 @@ with some inference optimizations.
 import math
 import warnings
 from typing import Optional, Tuple, Union
+from torchtyping import TensorType
 
 from torch.utils.checkpoint import checkpoint
-from torch import BoolTensor, LongTensor, Tensor, arange, bfloat16, bool as torch_bool, cat, einsum, empty, float16, float32, int32, ones, pow
-from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Linear as TorchLinear, Module, ModuleList
+from torch import BoolTensor, LongTensor, Tensor, arange, bfloat16, bool as torch_bool, cat, dtype as torch_dtype, einsum, empty, float16, float32, int32, ones, pow
+from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Linear as TorchLinear, Module, ModuleList, Parameter
 from torch.nn.functional import dropout, scaled_dot_product_attention, softmax
 
 from transformers.modeling_outputs import (
@@ -24,13 +25,18 @@ from configuration_RW import RWConfig
 logger = logging.get_logger(__name__)
 
 
-class Linear(TorchLinear):
-    def forward(self, input: Tensor) -> Tensor:
-        ret = input @ self.weight.T
-        if self.bias is None:
-            return ret
-        else:
-            return ret + self.bias
+NLD = TensorType["N", "L", "D"]
+
+
+# Skip weight init since we are only run finetuning or inference
+class Linear(Module):
+    def __init__(self, in_features: int, out_features: int, dtype: torch_dtype) -> None:
+        super().__init__()
+
+        self.weight = Parameter(empty((out_features, in_features), dtype=dtype))
+
+    def forward(self, input: NLD) -> NLD:
+        return input @ self.weight.T  # From the falcon implementation. Why not linear(embeds, self.weight)?
 
 
 # rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
@@ -167,10 +173,10 @@ class Attention(Module):
         self.query_key_value = Linear(
             self.hidden_size,
             3 * self.hidden_size if not config.multi_query else (self.hidden_size + 2 * self.head_dim),
-            bias=config.bias,
+            dtype=config.torch_dtype,
         )
         self.multi_query = config.multi_query
-        self.dense = Linear(self.hidden_size, self.hidden_size, bias=config.bias)
+        self.dense = Linear(self.hidden_size, self.hidden_size, dtype=config.torch_dtype)
         self.attention_dropout = Dropout(config.attention_dropout)
         self.num_kv = config.n_head if not self.multi_query else 1
 
@@ -327,9 +333,9 @@ class MLP(Module):
         super().__init__()
         hidden_size = config.hidden_size
 
-        self.dense_h_to_4h = Linear(hidden_size, 4 * hidden_size, bias=config.bias)
+        self.dense_h_to_4h = Linear(hidden_size, 4 * hidden_size, dtype=config.torch_dtype)
         self.act = GELU()
-        self.dense_4h_to_h = Linear(4 * hidden_size, hidden_size, bias=config.bias)
+        self.dense_4h_to_h = Linear(4 * hidden_size, hidden_size, dtype=config.torch_dtype)
         self.hidden_dropout = config.hidden_dropout
 
     def forward(self, x: Tensor) -> Tensor:
@@ -424,12 +430,8 @@ class RWPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module: Module):
         """Initialize the weights."""
-        if isinstance(module, TorchLinear) or isinstance(module, Linear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
+        if isinstance(module, Linear):
+            pass  # Skip init since we only run finetuning or inference
         elif isinstance(module, Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
@@ -676,7 +678,7 @@ class RWForCausalLM(RWPreTrainedModel):
     def __init__(self, config: RWConfig):
         super().__init__(config)
         self.transformer = RWModel(config)
-        self.lm_head = TorchLinear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, dtype=config.torch_dtype)
 
         # Initialize weights and apply final processing
         self.post_init()
