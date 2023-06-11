@@ -178,7 +178,6 @@ class Attention(Module):
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
-        output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
 
@@ -223,10 +222,7 @@ class Attention(Module):
         attn_output = x.reshape(batch_size, q_length, self.num_heads * self.head_dim)
 
         output_tensor = self.dense(attn_output)
-
-        outputs = (output_tensor, present)
-        assert not output_attentions  # not supported.
-        return outputs
+        return output_tensor, present
 
 
 class MLP(Module):
@@ -271,7 +267,6 @@ class DecoderLayer(Module):
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
         head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
-        output_attentions: bool = False,
     ):
 
         layernorm_output = self.input_layernorm(hidden_states)
@@ -283,7 +278,6 @@ class DecoderLayer(Module):
             layer_past=layer_past,
             head_mask=head_mask,
             use_cache=use_cache,
-            output_attentions=output_attentions,
         )
 
         attention_output = attn_outputs[0]
@@ -412,12 +406,10 @@ class RWModel(RWPreTrainedModel):
         head_mask: Optional[LongTensor] = None,
         inputs_embeds: Optional[LongTensor] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -448,7 +440,6 @@ class RWModel(RWPreTrainedModel):
         hidden_states = inputs_embeds
 
         presents = () if use_cache else None
-        all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
         for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
@@ -467,7 +458,7 @@ class RWModel(RWPreTrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, use_cache=use_cache, output_attentions=output_attentions)
+                        return module(*inputs, use_cache=use_cache)
 
                     return custom_forward
 
@@ -482,15 +473,11 @@ class RWModel(RWPreTrainedModel):
                     layer_past=layer_past,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
-                    output_attentions=output_attentions,
                 )
 
             hidden_states = outputs[0]
             if use_cache is True:
                 presents = presents + (outputs[1],)
-
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
 
         # Add last hidden state
         hidden_states = self.ln_f(hidden_states)
@@ -499,13 +486,12 @@ class RWModel(RWPreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+            return tuple(v for v in [hidden_states, presents, all_hidden_states] if v is not None)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
         )
 
 
@@ -555,7 +541,6 @@ class RWForCausalLM(RWPreTrainedModel):
         inputs_embeds: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **deprecated_arguments,
@@ -574,7 +559,6 @@ class RWForCausalLM(RWPreTrainedModel):
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
