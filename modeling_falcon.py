@@ -273,42 +273,6 @@ class RWPreTrainedModel(PreTrainedModel):
         if isinstance(module, RWModel):
             module.gradient_checkpointing = value
 
-    @staticmethod
-    def _convert_to_standard_cache(
-        past_key_value: Tuple[Tuple[Tensor, Tensor]], batch_size: int
-    ) -> Tuple[Tuple[Tensor, Tensor]]:
-        """
-        Standardizes the format of the cache so as to match most implementations, i.e. to tuple(tuple([batch_size,
-        num_heads, ...]))
-        """
-        batch_size_times_num_heads, head_dim, seq_length = past_key_value[0][0].shape
-        num_heads = batch_size_times_num_heads // batch_size
-        # key: [batch_size * num_heads, head_dim, seq_length] -> [batch_size, num_heads, head_dim, seq_length]
-        # value: [batch_size * num_heads, seq_length, head_dim] -> [batch_size, num_heads, seq_length, head_dim]
-        return tuple(
-            (
-                layer_past[0].view(batch_size, num_heads, head_dim, seq_length),
-                layer_past[1].view(batch_size, num_heads, seq_length, head_dim),
-            )
-            for layer_past in past_key_value
-        )
-
-    @staticmethod
-    def _convert_to_rw_cache(
-        past_key_value: Tuple[Tuple[Tensor, Tensor]]
-    ) -> Tuple[Tuple[NHLDkv, NHLDkv]]:
-        batch_size, num_heads, head_dim, seq_length = past_key_value[0][0].shape
-        batch_size_times_num_heads = batch_size * num_heads
-        # key:  [batch_size, num_heads, head_dim, seq_length] -> [batch_size * num_heads, head_dim, seq_length]
-        # value: [batch_size, num_heads, seq_length, head_dim] -> [batch_size * num_heads, seq_length, head_dim]
-        return tuple(
-            (
-                layer_past[0].view(batch_size_times_num_heads, head_dim, seq_length),
-                layer_past[1].view(batch_size_times_num_heads, seq_length, head_dim),
-            )
-            for layer_past in past_key_value
-        )
-
 
 class RWModel(RWPreTrainedModel):
     def __init__(self, config: RWConfig):
@@ -443,17 +407,8 @@ class RWForCausalLM(RWPreTrainedModel):
         attention_mask: Optional[NL] = None,  # Unused
         **kwargs,
     ) -> dict:
-        if past_key_values:
+        if past_key_values is not None:
             input_ids: NL = input_ids[:, -1:]  # Get last token
-
-            # TODO this may be necessary, but first trying without it.
-            # # the cache may be in the stardard format (e.g. in contrastive search), convert to our's format if needed
-            # # past_key_values is a num_layers length tuple
-            # # of tuples of (past_keys, past_values)
-            # first_layer_key_values: Tuple[NLD, NLD] = past_key_values[0]
-            # first_layer_keys: NLD = first_layer_key_values[0]
-            # if first_layer_keys.size(0) == input_ids.size(0):
-            #     past_key_values = self._convert_to_rw_cache(past_key_values)
 
         return {
             "input_ids": input_ids,
@@ -517,27 +472,17 @@ class RWForCausalLM(RWPreTrainedModel):
         )
 
     def _reorder_cache(
-        self, past: Tuple[Tuple[Tensor, Tensor], ...], beam_idx: LongTensor
-    ) -> Tuple[Tuple[Tensor, Tensor], ...]:
-        """
-        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
-        [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
-        beam_idx at every generation step.
-
-        Output shares the same memory storage as `past`.
-        """
-        raise NotImplementedError("Not sure how to use this at the moment...")
-        standardized_past = self._convert_to_standard_cache(past, batch_size=len(beam_idx))
-
+        self, past_key_values: Tuple[Tuple[NHLDkv, NHLDkv]], beam_idx: LongTensor
+    ) -> Tuple[Tuple[NHLDkv, NHLDkv]]:
         # Get a copy of `beam_idx` on all the devices where we need those indices.
         device_to_beam_idx = {
-            past_state.device: beam_idx.to(past_state.device) for layer_past in past for past_state in layer_past
+            past_state.device: beam_idx.to(past_state.device) for layer_past in past_key_values for past_state in layer_past
         }
         reordered_past = tuple(
             (
                 layer_past[0].index_select(0, device_to_beam_idx[layer_past[0].device]),
                 layer_past[1].index_select(0, device_to_beam_idx[layer_past[0].device]),
             )
-            for layer_past in standardized_past
+            for layer_past in past_key_values
         )
-        return self._convert_to_rw_cache(reordered_past)
+        return reordered_past
