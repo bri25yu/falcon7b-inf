@@ -140,7 +140,7 @@ class Attention(Module):
         fused_qkv: NLD = self.query_key_value(hidden_states)
         fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2 * Nkv, Dkv)
         query: NHLDkv = fused_qkv[:, :, :-2 * Nkv, :].transpose(1, 2)
-        key: NHLDkv = fused_qkv[:, :, -2 * Nkv: -Nkv-1, :].transpose(1, 2)
+        key: NHLDkv = fused_qkv[:, :, -2 * Nkv: -Nkv, :].transpose(1, 2)
         value: NHLDkv = fused_qkv[:, :, -Nkv:, :].transpose(1, 2)
         query, key = self.maybe_rotary(query, key, past_key_value_length)
 
