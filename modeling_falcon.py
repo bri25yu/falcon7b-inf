@@ -5,10 +5,11 @@ with some inference optimizations.
 from typing import Optional, Tuple, Union
 from torchtyping import TensorType
 
-from torch.utils.checkpoint import checkpoint
 from torch import LongTensor, Tensor, arange, bfloat16, cat, device as torch_device, dtype as torch_dtype, empty, float16, outer
 from torch.nn import CrossEntropyLoss, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
 from torch.nn.functional import dropout, scaled_dot_product_attention, linear
+from torch.utils.checkpoint import checkpoint
+from torch.nn.utils import skip_init
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -270,13 +271,13 @@ class RWModel(RWPreTrainedModel):
         self.num_heads = config.n_head
 
         # Embedding + LN Embedding
-        self.word_embeddings = Embedding(config.vocab_size, self.embed_dim)
+        self.word_embeddings = skip_init(Embedding, config.vocab_size, self.embed_dim)
 
         # Transformer blocks
         self.h = ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
-        self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        self.ln_f = skip_init(LayerNorm, self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
 
