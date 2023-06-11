@@ -95,6 +95,9 @@ class RotaryEmbedding(Module):
         if past_key_value_length is not None:
             cos = cos[:, :, [L-1], :]
             sin = sin[:, :, [L-1], :]
+        else:
+            cos = cos[:, :, :L, :]
+            sin = sin[:, :, :L, :]
 
         return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
 
