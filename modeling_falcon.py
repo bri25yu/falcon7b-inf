@@ -428,21 +428,21 @@ class RWForCausalLM(RWPreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         input_ids: LongTensor,
-        past: Optional[Tensor] = None,
+        past_key_values: Optional[Tensor] = None,
         attention_mask: Optional[Tensor] = None,  # Unused
         **kwargs,
     ) -> dict:
         # only last token for input_ids if past is not None
-        if past:
+        if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
 
             # the cache may be in the stardard format (e.g. in contrastive search), convert to our's format if needed
-            if past[0][0].shape[0] == input_ids.shape[0]:
-                past = self._convert_to_rw_cache(past)
+            if past_key_values[0][0].shape[0] == input_ids.shape[0]:
+                past_key_values = self._convert_to_rw_cache(past_key_values)
 
         return {
             "input_ids": input_ids,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "use_cache": kwargs.get("use_cache"),
         }
 
