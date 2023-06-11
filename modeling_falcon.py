@@ -10,8 +10,8 @@ from torchtyping import TensorType
 
 from torch.utils.checkpoint import checkpoint
 from torch import BoolTensor, LongTensor, Tensor, arange, bfloat16, bool as torch_bool, cat, dtype as torch_dtype, einsum, empty, float16, float32, int32, ones, pow
-from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Linear as TorchLinear, Module, ModuleList, Parameter
-from torch.nn.functional import dropout, scaled_dot_product_attention, softmax
+from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
+from torch.nn.functional import dropout, scaled_dot_product_attention, softmax, linear
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -36,7 +36,7 @@ class Linear(Module):
         self.weight = Parameter(empty((out_features, in_features), dtype=dtype))
 
     def forward(self, input: NLD) -> NLD:
-        return input @ self.weight.T  # From the falcon implementation. Why not linear(embeds, self.weight)?
+        return linear(input, self.weight)
 
 
 # rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
