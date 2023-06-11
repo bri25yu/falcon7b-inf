@@ -45,12 +45,19 @@ class Linear(Module):
 
 
 def apply_rotary(embeds, cos, sin):
-    # embeds is NHLDkv, cos and sin are 11LDkv. and output is NHLDkv
+    # embeds is NHLDkv, cos and sin are 11LDkv. output is NHLDkv
     halfDkv = embeds.size(3) // 2
     left_half, right_half = embeds[:, :, :, :halfDkv], embeds[:, :, :, halfDkv:]
     embeds_half_rotated = cat((-right_half, left_half), dim=3)
 
     return embeds * cos + embeds_half_rotated * sin
+
+
+def rotate_half(embeds):
+    # embeds is NHLDkv and output is NHLDkv
+    halfDkv = embeds.size(3) // 2
+    left_half, right_half = embeds[:, :, :, :halfDkv], embeds[:, :, :, halfDkv:]
+    return cat((-right_half, left_half), dim=3)
 
 
 class RotaryEmbedding(Module):
@@ -99,7 +106,10 @@ class RotaryEmbedding(Module):
             cos = cos[:, :, :L, :]
             sin = sin[:, :, :L, :]
 
-        return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
+        # return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
+        query = query * cos + rotate_half(query) * sin
+        key = key * cos + rotate_half(key) * sin
+        return query, key
 
 
 class Attention(Module):
