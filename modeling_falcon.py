@@ -364,11 +364,8 @@ class RWModel(RWPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **deprecated_arguments,
+        **kwargs,
     ) -> Union[Tuple[Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
-        if len(deprecated_arguments) > 0:
-            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
-
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -499,7 +496,7 @@ class RWForCausalLM(RWPreTrainedModel):
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **deprecated_arguments,
+        **kwargs,
     ) -> Union[Tuple[Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
         labels (`LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -507,9 +504,6 @@ class RWForCausalLM(RWPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
-        if len(deprecated_arguments) > 0:
-            raise ValueError(f"Got unexpected arguments: {deprecated_arguments}")
-
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         transformer_outputs = self.transformer(
