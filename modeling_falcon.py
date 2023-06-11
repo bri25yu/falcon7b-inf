@@ -113,7 +113,6 @@ class Attention(Module):
         self,
         hidden_states: NLD,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
-        head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
     ) -> Tuple[NLD, Tuple[NLD, NLD]]:
         Dkv, Nkv, H = self.Dkv, self.Nkv, self.H
@@ -198,7 +197,6 @@ class DecoderLayer(Module):
         self,
         hidden_states: Tensor,
         layer_past: Optional[Tuple[Tensor, Tensor]] = None,
-        head_mask: Optional[Tensor] = None,
         use_cache: bool = False,
     ):
 
@@ -209,7 +207,6 @@ class DecoderLayer(Module):
         attn_outputs = self.self_attention(
             layernorm_output,
             layer_past=layer_past,
-            head_mask=head_mask,
             use_cache=use_cache,
         )
 
@@ -253,16 +250,8 @@ class RWPreTrainedModel(PreTrainedModel):
         super().__init__(*inputs, **kwargs)
 
     def _init_weights(self, module: Module):
-        """Initialize the weights."""
-        if isinstance(module, Linear):
-            pass  # Skip init since we only run finetuning or inference
-        elif isinstance(module, Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+        # Skip init since we only run finetuning or inference
+        return
 
     def _set_gradient_checkpointing(self, module: Module, value: bool = False):
         if isinstance(module, RWModel):
@@ -336,7 +325,6 @@ class RWModel(RWPreTrainedModel):
         self,
         input_ids: Optional[LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
-        head_mask: Optional[LongTensor] = None,
         inputs_embeds: Optional[LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -360,12 +348,6 @@ class RWModel(RWPreTrainedModel):
 
         if past_key_values is None:
             past_key_values = tuple([None] * len(self.h))
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape batch_size x num_heads x N x N
-        # head_mask has shape n_layer x batch x num_heads x N x N
-        head_mask = self.get_head_mask(head_mask, self.config.n_layer)
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
@@ -398,13 +380,11 @@ class RWModel(RWPreTrainedModel):
                 outputs = checkpoint(
                     create_custom_forward(block),
                     hidden_states,
-                    head_mask[i],
                 )
             else:
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
-                    head_mask=head_mask[i],
                     use_cache=use_cache,
                 )
 
@@ -470,7 +450,6 @@ class RWForCausalLM(RWPreTrainedModel):
         self,
         input_ids: Optional[LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[Tensor, Tensor], ...]] = None,
-        head_mask: Optional[Tensor] = None,
         inputs_embeds: Optional[Tensor] = None,
         labels: Optional[Tensor] = None,
         use_cache: Optional[bool] = None,
@@ -489,7 +468,6 @@ class RWForCausalLM(RWPreTrainedModel):
         transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
-            head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
