@@ -106,7 +106,7 @@ class Attention(Module):
             raise ValueError(f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {D} and `num_heads`: {H}).")
 
         self.maybe_rotary = RotaryEmbedding(Dkv)
-        self.query_key_value = Linear(D, D + Nkv * Dkv, dtype=config.torch_dtype)
+        self.query_key_value = Linear(D, D + 2 * Nkv * Dkv, dtype=config.torch_dtype)
         self.dense: DD = Linear(D, D, dtype=config.torch_dtype)
 
     def forward(
@@ -120,8 +120,8 @@ class Attention(Module):
         N, L, _ = hidden_states.size()
 
         fused_qkv: NLD = self.query_key_value(hidden_states)
-        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + Nkv, Dkv)
-        query: NLHDkv = fused_qkv[:, :, :-2, :]
+        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2 * Nkv, Dkv)
+        query: NLHDkv = fused_qkv[:, :, :-2, :]  # Hardcoded for Nkv = 1
         key: NLHDkv = fused_qkv[:, :, [-2], :]
         value: NLHDkv = fused_qkv[:, :, [-1], :]
 
