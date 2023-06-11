@@ -26,8 +26,9 @@ HalfDkv = TensorType["Dkv/2"]
 LHalfDkv = TensorType["L", "Dkv/2"]
 LDkv = TensorType["L", "Dkv"]
 DD = TensorType["Dout", "Din"]
+NL = TensorType["N", "L"]
 NLD = TensorType["N", "L", "D"]
-_1LDkv = TensorType["1", "L", "Dkv"]
+_11LDkv = TensorType["1", "1", "L", "Dkv"]
 NHLDkv = TensorType["N", "H", "L", "Dkv"]
 NLHDkv = TensorType["N", "L", "H", "Dkv"]
 
@@ -44,10 +45,10 @@ class Linear(Module):
 
 
 def rotate_half(embeds):
-    # embeds is NLDkv and output is NLDkv
-    halfDkv = embeds.size(2) // 2
-    left_half, right_half = embeds[:, :, :halfDkv], embeds[:, :, halfDkv:]
-    return cat((-right_half, left_half), dim=2)
+    # embeds is NHLDkv and output is NHLDkv
+    halfDkv = embeds.size(3) // 2
+    left_half, right_half = embeds[:, :, :, :halfDkv], embeds[:, :, :, halfDkv:]
+    return cat((-right_half, left_half), dim=3)
 
 
 class RotaryEmbedding(Module):
@@ -57,10 +58,10 @@ class RotaryEmbedding(Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self.seq_len_cached = None
-        self.cos_cached: _1LDkv | None = None
-        self.sin_cached: _1LDkv | None = None
+        self.cos_cached: _11LDkv | None = None
+        self.sin_cached: _11LDkv | None = None
 
-    def initialize_cos_sin(self, L: int, device: torch_device, dtype: torch_dtype) -> Tensor:
+    def initialize_cos_sin(self, L: int, device: torch_device, dtype: torch_dtype) -> None:
         if L != self.seq_len_cached:
             self.seq_len_cached = L
 
@@ -71,26 +72,20 @@ class RotaryEmbedding(Module):
             if dtype in [float16, bfloat16]:
                 emb = emb.float()
 
-            self.cos_cached: _1LDkv = emb.cos()[None, :, :]
-            self.sin_cached: _1LDkv = emb.sin()[None, :, :]
+            self.cos_cached: _11LDkv = emb.cos()[None, None, :, :]
+            self.sin_cached: _11LDkv = emb.sin()[None, None, :, :]
 
-            self.cos_cached: _1LDkv = self.cos_cached.type(dtype)
-            self.sin_cached: _1LDkv = self.sin_cached.type(dtype)
+            self.cos_cached: _11LDkv = self.cos_cached.type(dtype)
+            self.sin_cached: _11LDkv = self.sin_cached.type(dtype)
 
-    def forward(self, query: NLD, key: NLD) -> Tuple[NLD, NLD]:
+    def forward(self, query: NHLDkv, key: NHLDkv) -> Tuple[NHLDkv, NHLDkv]:
         L = query.size(1)
         self.initialize_cos_sin(L, query.device, query.dtype)
 
         cos, sin = self.cos_cached, self.sin_cached
-        query: NLD = query * cos + rotate_half(query) * sin
-        key: NLD = key * cos + rotate_half(key) * sin
+        query: NHLDkv = query * cos + rotate_half(query) * sin
+        key: NHLDkv = key * cos + rotate_half(key) * sin
         return query, key
-
-
-def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
-    out = dropout(x, p=prob, training=training)
-    out = residual + out
-    return out
 
 
 class Attention(Module):
@@ -112,47 +107,32 @@ class Attention(Module):
     def forward(
         self,
         hidden_states: NLD,
-        layer_past: Optional[Tuple[Tensor, Tensor]] = None,
+        layer_past: Optional[Tuple[NHLDkv, NHLDkv]] = None,
         use_cache: bool = False,
-    ) -> Tuple[NLD, Tuple[NLD, NLD]]:
+    ) -> Tuple[NLD, Tuple[NHLDkv, NHLDkv]]:
         Dkv, Nkv, H = self.Dkv, self.Nkv, self.H
         N, L, _ = hidden_states.size()
 
         fused_qkv: NLD = self.query_key_value(hidden_states)
         fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2 * Nkv, Dkv)
-        query: NLHDkv = fused_qkv[:, :, :-2, :]  # Hardcoded for Nkv = 1
-        key: NLHDkv = fused_qkv[:, :, [-2], :]
-        value: NLHDkv = fused_qkv[:, :, [-1], :]
-
-        query: NLD = query.transpose(1, 2).reshape(N * H, L, Dkv)
-        key: NLD = key.transpose(1, 2).reshape(N * Nkv, L, Dkv)
-        value: NLD = value.transpose(1, 2).reshape(N * Nkv, L, Dkv)
-
+        # Hardcoded for Nkv = 1
+        query: NHLDkv = fused_qkv[:, :, :-2, :].transpose(1, 2)
+        key: NHLDkv = fused_qkv[:, :, [-2], :].transpose(1, 2)
+        value: NHLDkv = fused_qkv[:, :, [-1], :].transpose(1, 2)
         query, key = self.maybe_rotary(query, key)
 
         if layer_past is not None:
+            past_key: NHLDkv
+            past_value: NHLDkv
             past_key, past_value = layer_past
-            # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-            key = cat((past_key, key), dim=1)
-            value = cat((past_value, value), dim=1)
-            print(key.size(), value.size())
+            key: NHLDkv = cat((past_key, key), dim=2)
+            value: NHLDkv = cat((past_value, value), dim=2)
 
-        present: Tuple[NLD, NLD] = (key, value) if use_cache is True else None
+        present: Tuple[NHLDkv, NHLDkv] = (key, value) if use_cache is True else None
 
-        query: NHLDkv = query.reshape(N, H, -1, Dkv)
-        key: NHLDkv = key.reshape(N, Nkv, -1, Dkv)
-        value: NHLDkv = value.reshape(N, Nkv, -1, Dkv)
-
-        attn_output: NHLDkv = scaled_dot_product_attention(
-            query, key, value, None, 0.0, is_causal=True
-        )
-
-        attn_output: NHLDkv = attn_output.view(N, H, L, Dkv)
+        attn_output: NHLDkv = scaled_dot_product_attention(query, key, value, is_causal=True)
         attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
         attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
-
         output_tensor: NLD = self.dense(attn_output)
         return output_tensor, present
 
@@ -171,6 +151,12 @@ class MLP(Module):
         x = self.act(self.dense_h_to_4h(x))
         x = self.dense_4h_to_h(x)
         return x
+
+
+def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
+    out = dropout(x, p=prob, training=training)
+    out = residual + out
+    return out
 
 
 class DecoderLayer(Module):
@@ -280,7 +266,7 @@ class RWPreTrainedModel(PreTrainedModel):
     @staticmethod
     def _convert_to_rw_cache(
         past_key_value: Tuple[Tuple[Tensor, Tensor]]
-    ) -> Tuple[Tuple[Tensor, Tensor]]:
+    ) -> Tuple[Tuple[NHLDkv, NHLDkv]]:
         batch_size, num_heads, head_dim, seq_length = past_key_value[0][0].shape
         batch_size_times_num_heads = batch_size * num_heads
         # key:  [batch_size, num_heads, head_dim, seq_length] -> [batch_size * num_heads, head_dim, seq_length]
@@ -339,11 +325,7 @@ class RWModel(RWPreTrainedModel):
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
-        elif input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
+        if input_ids is None and inputs_embeds is None:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         if past_key_values is None:
@@ -357,8 +339,7 @@ class RWModel(RWPreTrainedModel):
         presents = () if use_cache else None
         all_hidden_states = () if output_hidden_states else None
 
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-
+        for block, layer_past in zip(self.h, past_key_values):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -427,18 +408,22 @@ class RWForCausalLM(RWPreTrainedModel):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids: LongTensor,
-        past_key_values: Optional[Tensor] = None,
-        attention_mask: Optional[Tensor] = None,  # Unused
+        input_ids: NL,
+        past_key_values: Optional[Tuple[Tuple[NLD, NLD]]] = None,
+        attention_mask: Optional[NL] = None,  # Unused
         **kwargs,
     ) -> dict:
-        # only last token for input_ids if past is not None
         if past_key_values:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
+            input_ids: NL = input_ids[:, -1:]  # Get last token
 
-            # the cache may be in the stardard format (e.g. in contrastive search), convert to our's format if needed
-            if past_key_values[0][0].shape[0] == input_ids.shape[0]:
-                past_key_values = self._convert_to_rw_cache(past_key_values)
+            # TODO this may be necessary, but first trying without it.
+            # # the cache may be in the stardard format (e.g. in contrastive search), convert to our's format if needed
+            # # past_key_values is a num_layers length tuple
+            # # of tuples of (past_keys, past_values)
+            # first_layer_key_values: Tuple[NLD, NLD] = past_key_values[0]
+            # first_layer_keys: NLD = first_layer_key_values[0]
+            # if first_layer_keys.size(0) == input_ids.size(0):
+            #     past_key_values = self._convert_to_rw_cache(past_key_values)
 
         return {
             "input_ids": input_ids,
@@ -511,6 +496,7 @@ class RWForCausalLM(RWPreTrainedModel):
 
         Output shares the same memory storage as `past`.
         """
+        raise NotImplementedError("Not sure how to use this at the moment...")
         standardized_past = self._convert_to_standard_cache(past, batch_size=len(beam_idx))
 
         # Get a copy of `beam_idx` on all the devices where we need those indices.
