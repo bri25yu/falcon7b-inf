@@ -79,7 +79,7 @@ class RotaryEmbedding(Module):
             self.sin_cached: _11LDkv = self.sin_cached.type(dtype)
 
     def forward(self, query: NHLDkv, key: NHLDkv) -> Tuple[NHLDkv, NHLDkv]:
-        L = query.size(1)
+        L = query.size(2)
         self.initialize_cos_sin(L, query.device, query.dtype)
 
         cos, sin = self.cos_cached, self.sin_cached
