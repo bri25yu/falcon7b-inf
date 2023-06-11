@@ -10,19 +10,16 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
+from torch.nn import CrossEntropyLoss, LayerNorm
 from torch.nn import functional as F
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-from .configuration_RW import RWConfig
+from configuration_RW import RWConfig
 
 logger = logging.get_logger(__name__)
 
