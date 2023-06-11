@@ -144,8 +144,9 @@ class Attention(Module):
         value: NHLDkv = fused_qkv[:, :, -Nkv:, :].transpose(1, 2)
         query, key = self.maybe_rotary(query, key, past_key_value_length)
 
-        key: NHLDkv = cat((past_key, key), dim=2)
-        value: NHLDkv = cat((past_value, value), dim=2)
+        if using_past_key_values:  # Concatenate after relative positional encoding to not duplicate encoding
+            key: NHLDkv = cat((past_key, key), dim=2)
+            value: NHLDkv = cat((past_value, value), dim=2)
 
         present: Tuple[NHLDkv, NHLDkv] = (key, value) if use_cache is True else None
 
