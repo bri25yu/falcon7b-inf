@@ -2,15 +2,14 @@
 This is a copy of https://huggingface.co/tiiuae/falcon-7b-instruct/blob/main/modelling_RW.py
 with some inference optimizations.
 """
-
-import math
 from typing import Optional, Tuple, Union
 from torchtyping import TensorType
 
 from torch.utils.checkpoint import checkpoint
-from torch import LongTensor, Tensor, arange, bfloat16, cat, dtype as torch_dtype, einsum, empty, float16
+from torch import LongTensor, Tensor, arange, bfloat16, cat, device as torch_device, dtype as torch_dtype, empty, float16, outer
 from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
 from torch.nn.functional import dropout, scaled_dot_product_attention, linear
+from torch.jit import script
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -24,7 +23,12 @@ from configuration_RW import RWConfig
 logger = logging.get_logger(__name__)
 
 
+HalfDkv = TensorType["Dkv/2"]
+LHalfDkv = TensorType["L", "Dkv/2"]
+LDkv = TensorType["L", "Dkv"]
+DD = TensorType["Dout", "Din"]
 NLD = TensorType["N", "L", "D"]
+_1LDkv = TensorType["1", "L", "Dkv"]
 
 
 # Skip weight init since we are only run finetuning or inference
@@ -32,61 +36,60 @@ class Linear(Module):
     def __init__(self, in_features: int, out_features: int, dtype: torch_dtype) -> None:
         super().__init__()
 
-        self.weight = Parameter(empty((out_features, in_features), dtype=dtype))
+        self.weight: DD = Parameter(empty((out_features, in_features), dtype=dtype))
 
     def forward(self, input: NLD) -> NLD:
         return linear(input, self.weight)
 
 
-# rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
-def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return cat((-x2, x1), dim=x1.ndim - 1)  # dim=-1 triggers a bug in torch < 1.8.0
+@script
+def apply_rotary(embeds, cos, sin):
+    # embeds is NLD, cos and sin are _1LDkv. output is NLD
+
+    L = embeds.size(1)
+    cos = cos[:, :L, :]  # _1LDkv
+    sin = sin[:, :L, :]  # _1LDkv
+
+    # left_half and right_half are NLHalfDkv. embeds_half_rotated is NLDkv
+    left_half, right_half = embeds.chunk(2, dim=2)  # In the D dimension
+    embeds_half_rotated = cat((-right_half, left_half), dim=2)
+
+    return embeds * cos + embeds_half_rotated * sin
 
 
 class RotaryEmbedding(Module):
-    """Implementation of RotaryEmbedding from GPT-NeoX.
-    This implementation is design to operate on queries and keys that are compatible with
-    [batch_size, n_heads_per_partition, seq_len, head_dim] (e.g. MinGPTAttention format).
-    """
-
-    def __init__(self, head_dim: int, base: float=10000) -> None:
+    def __init__(self, Dkv: int, base: float=10000) -> None:
         super().__init__()
-        inv_freq = 1.0 / (base ** (arange(0, head_dim, 2).float() / head_dim))
+        inv_freq: HalfDkv = 1.0 / (base ** (arange(0, Dkv, 2).float() / Dkv))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.head_dim = head_dim
-        self.seq_len_cached = None
-        self.batch_size_cached = None
-        self.cos_cached: Tensor | None = None
-        self.sin_cached: Tensor | None = None
 
-    def cos_sin(
-        self,
-        seq_len: int,
-        device="cuda",
-        dtype=bfloat16,
-    ) -> Tensor:
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = arange(seq_len, device=device).type_as(self.inv_freq)
-            freqs = einsum("i,j->ij", t, self.inv_freq)
-            emb = cat((freqs, freqs), dim=-1).to(device)
+        self.seq_len_cached = None
+        self.cos_cached: _1LDkv | None = None
+        self.sin_cached: _1LDkv | None = None
+
+    def initialize_cos_sin(self, L: int, device: torch_device, dtype: torch_dtype) -> Tensor:
+        if L != self.seq_len_cached:
+            self.seq_len_cached = L
+
+            t = arange(L, device=device).type_as(self.inv_freq)
+            freqs: LHalfDkv = outer(t, self.inv_freq)
+            emb: LDkv = cat((freqs, freqs), dim=1).to(device)
 
             if dtype in [float16, bfloat16]:
                 emb = emb.float()
 
-            self.cos_cached = emb.cos()[None, :, :]
-            self.sin_cached = emb.sin()[None, :, :]
+            self.cos_cached: _1LDkv = emb.cos()[None, :, :]
+            self.sin_cached: _1LDkv = emb.sin()[None, :, :]
 
-            self.cos_cached = self.cos_cached.type(dtype)
-            self.sin_cached = self.sin_cached.type(dtype)
+            self.cos_cached: _1LDkv = self.cos_cached.type(dtype)
+            self.sin_cached: _1LDkv = self.sin_cached.type(dtype)
 
-        return self.cos_cached, self.sin_cached
+    def forward(self, query: NLD, key: NLD) -> Tuple[NLD, NLD]:
+        L = query.size(1)
+        self.initialize_cos_sin(L, query.device, query.dtype)
 
-    def forward(self, q, k):
-        batch, seq_len, head_dim = q.shape
-        cos, sin = self.cos_sin(seq_len, q.device, q.dtype)
-        return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+        cos, sin = self.cos_cached, self.sin_cached
+        return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
 
 
 def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
@@ -112,10 +115,6 @@ class Attention(Module):
             )
 
         self.maybe_rotary = RotaryEmbedding(config.head_dim) if config.rotary else lambda q, k: (q, k)
-
-        # Layer-wise attention scaling
-        self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
-        self.beta = self.inv_norm_factor
 
         self.query_key_value = Linear(
             self.hidden_size,
