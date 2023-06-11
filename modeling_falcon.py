@@ -44,30 +44,33 @@ class Linear(Module):
         return linear(input, self.weight)
 
 
-def rotate_half(embeds):
-    # embeds is NHLDkv and output is NHLDkv
+def apply_rotary(embeds, cos, sin):
+    # embeds is NHLDkv, cos and sin are 11LDkv. and output is NHLDkv
     halfDkv = embeds.size(3) // 2
     left_half, right_half = embeds[:, :, :, :halfDkv], embeds[:, :, :, halfDkv:]
-    return cat((-right_half, left_half), dim=3)
+    embeds_half_rotated = cat((-right_half, left_half), dim=3)
+
+    return embeds * cos + embeds_half_rotated * sin
 
 
 class RotaryEmbedding(Module):
-    def __init__(self, Dkv: int, base: float=10000) -> None:
+    def __init__(self, config: RWConfig, base: float=10000) -> None:
         super().__init__()
+
+        Dkv = config.head_dim
         inv_freq: HalfDkv = 1.0 / (base ** (arange(0, Dkv, 2).float() / Dkv))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        self.seq_len_cached = None
-        self.cos_cached: _11LDkv | None = None
-        self.sin_cached: _11LDkv | None = None
+        self.seq_len_cached: int = 0
+        self.initialize_cos_sin(config.custom_max_length, config.torch_dtype)
 
-    def initialize_cos_sin(self, L: int, device: torch_device, dtype: torch_dtype) -> None:
-        if L != self.seq_len_cached:
+    def initialize_cos_sin(self, L: int, dtype: torch_dtype) -> None:
+        if self.seq_len_cached < L:
             self.seq_len_cached = L
 
-            t = arange(L, device=device).type_as(self.inv_freq)
+            t = arange(L).type_as(self.inv_freq)
             freqs: LHalfDkv = outer(t, self.inv_freq)
-            emb: LDkv = cat((freqs, freqs), dim=1).to(device)
+            emb: LDkv = cat((freqs, freqs), dim=1)
 
             if dtype in [float16, bfloat16]:
                 emb = emb.float()
@@ -78,14 +81,22 @@ class RotaryEmbedding(Module):
             self.cos_cached: _11LDkv = self.cos_cached.type(dtype)
             self.sin_cached: _11LDkv = self.sin_cached.type(dtype)
 
-    def forward(self, query: NHLDkv, key: NHLDkv) -> Tuple[NHLDkv, NHLDkv]:
-        L = query.size(2)
-        self.initialize_cos_sin(L, query.device, query.dtype)
+    def move_cos_sin_devices(self, device: torch_device) -> None:
+        if device != self.cos_cached.device:
+            self.cos_cached = self.cos_cached.to(device)
+            self.sin_cached = self.sin_cached.to(device)
+
+    def forward(self, query: NHLDkv, key: NHLDkv, past_key_value_length: Optional[int]=None) -> Tuple[NHLDkv, NHLDkv]:
+        L = key.size(2) + (past_key_value_length if past_key_value_length is not None else 0)
+        self.initialize_cos_sin(L, key.device, key.dtype)
+        self.move_cos_sin_devices(query.device)
 
         cos, sin = self.cos_cached, self.sin_cached
-        query: NHLDkv = query * cos + rotate_half(query) * sin
-        key: NHLDkv = key * cos + rotate_half(key) * sin
-        return query, key
+        if past_key_value_length is not None:
+            cos = cos[:, :, [L-1], :]
+            sin = sin[:, :, [L-1], :]
+
+        return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
 
 
 class Attention(Module):
@@ -100,7 +111,7 @@ class Attention(Module):
         if Dkv * H != D:
             raise ValueError(f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {D} and `num_heads`: {H}).")
 
-        self.maybe_rotary = RotaryEmbedding(Dkv)
+        self.maybe_rotary = RotaryEmbedding(config)
         self.query_key_value = Linear(D, D + 2 * Nkv * Dkv, dtype=config.torch_dtype)
         self.dense: DD = Linear(D, D, dtype=config.torch_dtype)
 
@@ -113,24 +124,29 @@ class Attention(Module):
         Dkv, Nkv, H = self.Dkv, self.Nkv, self.H
         N, L, _ = hidden_states.size()
 
-        fused_qkv: NLD = self.query_key_value(hidden_states)
-        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2 * Nkv, Dkv)
-        # Hardcoded for Nkv = 1
-        query: NHLDkv = fused_qkv[:, :, :-2, :].transpose(1, 2)
-        key: NHLDkv = fused_qkv[:, :, [-2], :].transpose(1, 2)
-        value: NHLDkv = fused_qkv[:, :, [-1], :].transpose(1, 2)
-        query, key = self.maybe_rotary(query, key)
-
         if layer_past is not None:
+            using_past_key_values = True
             past_key: NHLDkv
             past_value: NHLDkv
             past_key, past_value = layer_past
-            key: NHLDkv = cat((past_key, key), dim=2)
-            value: NHLDkv = cat((past_value, value), dim=2)
+            past_key_value_length = past_key.size(2)
+        else:
+            using_past_key_values = False
+            past_key_value_length = None
+
+        fused_qkv: NLD = self.query_key_value(hidden_states)
+        fused_qkv: NLHDkv = fused_qkv.view(N, L, H + 2 * Nkv, Dkv)
+        query: NHLDkv = fused_qkv[:, :, :-2 * Nkv, :].transpose(1, 2)
+        key: NHLDkv = fused_qkv[:, :, -2 * Nkv: -Nkv-1, :].transpose(1, 2)
+        value: NHLDkv = fused_qkv[:, :, -Nkv:, :].transpose(1, 2)
+        query, key = self.maybe_rotary(query, key, past_key_value_length)
+
+        key: NHLDkv = cat((past_key, key), dim=2)
+        value: NHLDkv = cat((past_value, value), dim=2)
 
         present: Tuple[NHLDkv, NHLDkv] = (key, value) if use_cache is True else None
 
-        attn_output: NHLDkv = scaled_dot_product_attention(query, key, value, is_causal=True)
+        attn_output: NHLDkv = scaled_dot_product_attention(query, key, value, is_causal=not using_past_key_values)
         attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
         attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
         output_tensor: NLD = self.dense(attn_output)
@@ -409,7 +425,7 @@ class RWForCausalLM(RWPreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         input_ids: NL,
-        past_key_values: Optional[Tuple[Tuple[NLD, NLD]]] = None,
+        past_key_values: Optional[Tuple[Tuple[NHLDkv, NHLDkv]]] = None,
         attention_mask: Optional[NL] = None,  # Unused
         **kwargs,
     ) -> dict:

@@ -80,3 +80,7 @@ class RWConfig(PretrainedConfig):
     @property
     def rotary(self):
         return not self.alibi
+
+    @property
+    def custom_max_length(self):
+        return 1500  # hardcoded for now
