@@ -9,7 +9,6 @@ from torch.utils.checkpoint import checkpoint
 from torch import LongTensor, Tensor, arange, bfloat16, cat, device as torch_device, dtype as torch_dtype, empty, float16, outer
 from torch.nn import CrossEntropyLoss, Dropout, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
 from torch.nn.functional import dropout, scaled_dot_product_attention, linear
-from torch.jit import script
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -42,19 +41,11 @@ class Linear(Module):
         return linear(input, self.weight)
 
 
-@script
-def apply_rotary(embeds, cos, sin):
-    # embeds is NLD, cos and sin are _1LDkv. output is NLD
-
-    L = embeds.size(1)
-    cos = cos[:, :L, :]  # _1LDkv
-    sin = sin[:, :L, :]  # _1LDkv
-
-    # left_half and right_half are NLHalfDkv. embeds_half_rotated is NLDkv
-    left_half, right_half = embeds.chunk(2, dim=2)  # In the D dimension
-    embeds_half_rotated = cat((-right_half, left_half), dim=2)
-
-    return embeds * cos + embeds_half_rotated * sin
+def rotate_half(embeds):
+    # embeds is NLDkv and output is NLDkv
+    halfDkv = embeds.size(2) // 2
+    left_half, right_half = embeds[:, :, :halfDkv], embeds[:, :, halfDkv:]
+    return cat((-right_half, left_half), dim=2)
 
 
 class RotaryEmbedding(Module):
@@ -89,7 +80,9 @@ class RotaryEmbedding(Module):
         self.initialize_cos_sin(L, query.device, query.dtype)
 
         cos, sin = self.cos_cached, self.sin_cached
-        return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
+        query: NLD = query * cos + rotate_half(query) * sin
+        key: NLD = key * cos + rotate_half(key) * sin
+        return query, key
 
 
 def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
