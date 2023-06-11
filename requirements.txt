@@ -4,4 +4,3 @@ sentencepiece==0.1.98
 accelerate==0.18.0
 xformers==0.0.20
 datasets==2.11.0
-apex @ git+https://github.com/NVIDIA/apex --install-option="-v" --install-option="--disable-pip-version-check" --install-option="--no-cache-dir" --global-option="--cpp_ext" --global-option="--cuda_ext"
