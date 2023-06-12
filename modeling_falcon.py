@@ -71,7 +71,7 @@ class RotaryEmbedding(Module):
 
             t = arange(L).type_as(self.inv_freq)
             freqs: LHalfDkv = outer(t, self.inv_freq)
-            emb: LDkv = cat((freqs, freqs), dim=1).to(device)
+            emb: LDkv = cat((freqs, freqs), dim=1)
 
             if dtype in [float16, bfloat16]:
                 emb = emb.float()
