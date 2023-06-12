@@ -95,20 +95,9 @@ def init_reimpl_model_best_match() -> Module:
     )
 
 
-if __name__ == "__main__":
-    base_output_fname = "base_output.pkl"
-    if exists(base_output_fname):
-        with open(base_output_fname, "rb") as f:
-            base_output = pickle.load(f)
-    else:
-        base_output = run_inference_on_model(init_base_model)
-        with open(base_output_fname, "wb") as f:
-            pickle.dump(base_output, f)
-
-    reimpl_output = run_inference_on_model(init_reimpl_model)
-
-    reimpl_best_match_output = run_inference_on_model(init_reimpl_model_best_match)
-
+def compare_outputs(
+    base_output: BenchmarkOutput, reimpl_best_match_output: BenchmarkOutput, reimpl_output: BenchmarkOutput
+) -> None:
     print(
         "Init time",
         f"\tBase model {base_output.init_time:.3f}s",
@@ -140,3 +129,23 @@ if __name__ == "__main__":
         print(reimpl_output.output_text.removeprefix(input_text + "\n"), "\n")
     else:
         print("Base and reimpl model outputs match")
+
+
+if __name__ == "__main__":
+    base_output_fname = "base_output.pkl"
+    if exists(base_output_fname):
+        with open(base_output_fname, "rb") as f:
+            base_output = pickle.load(f)
+    else:
+        base_output = run_inference_on_model(init_base_model)
+        with open(base_output_fname, "wb") as f:
+            pickle.dump(base_output, f)
+
+    reimpl_output = run_inference_on_model(init_reimpl_model)
+    reimpl_best_match_output = run_inference_on_model(init_reimpl_model_best_match)
+
+    compare_outputs(
+        base_output=base_output,
+        reimpl_best_match_output=reimpl_best_match_output,
+        reimpl_output=reimpl_output,
+    )
