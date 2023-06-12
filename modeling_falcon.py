@@ -99,7 +99,7 @@ class RotaryEmbedding(Module):
 
 
 class Attention(Module):
-    def __init__(self, config: RWConfig):
+    def __init__(self, config: RWConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
         super().__init__()
 
         D = config.hidden_size
@@ -110,7 +110,7 @@ class Attention(Module):
         if Dkv * H != D:
             raise ValueError(f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {D} and `num_heads`: {H}).")
 
-        self.maybe_rotary = RotaryEmbedding(config)
+        self.rotary = shared_rotary_embeddings
         self.query_key_value = Linear(D, D + 2 * Nkv * Dkv, dtype=config.torch_dtype)
         self.dense: DD = Linear(D, D, dtype=config.torch_dtype)
 
@@ -174,13 +174,13 @@ def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Ten
 
 
 class DecoderLayer(Module):
-    def __init__(self, config: RWConfig):
+    def __init__(self, config: RWConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
         super().__init__()
         hidden_size = config.hidden_size
 
         self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.num_heads = config.n_head
-        self.self_attention = Attention(config)
+        self.self_attention = Attention(config, shared_rotary_embeddings)
 
         if not config.parallel_attn:
             # unused if parallel attn
@@ -269,7 +269,8 @@ class RWModel(RWPreTrainedModel):
         self.word_embeddings = skip_init(Embedding, config.vocab_size, self.embed_dim)
 
         # Transformer blocks
-        self.h = ModuleList([DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        shared_rotary_embeddings = RotaryEmbedding(config)
+        self.h = ModuleList([DecoderLayer(config, shared_rotary_embeddings) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
         self.ln_f = skip_init(LayerNorm, self.embed_dim, eps=config.layer_norm_epsilon)
