@@ -37,22 +37,26 @@ def perform_generation(
 def repl(
     max_new_tokens_per_step: int=50,
     stop_word: str="STOP",
+    human_input_token: str="[|Human|]",
+    ai_input_token: str="[|AI|]",
 ) -> None:
-    print("Initializing generation...", end="")
+    print("Initializing generation...", end=" ")
     init_time = time()
     tokenizer, generator = initialize_generation()
     init_time = time() - init_time
-    print(f"...took {init_time:.1f}s")
+    print(f"took {init_time:.1f}s")
 
     print(f"Starting chatbot. If you want to quit, please input \"{stop_word}\".\n\n")
 
-    history = ""  # TODO This is heavily unoptimized
+    history = "The conversation between human and AI assistant."  # TODO This is heavily unoptimized
     try:
         while True:
             user_input = input()
-            if user_input == stop_word: break
+            if user_input == stop_word:
+                print("Goodbye!")
+                break
 
-            history += f"{user_input}{tokenizer.eos_token}"
+            history += f"{human_input_token} {user_input} {ai_input_token} "
 
             inference_step_time = time()
             output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
@@ -60,7 +64,7 @@ def repl(
 
             print(f"\t{output_text}\n\t({inference_step_time:.1f}s)")
 
-            history += f"{output_text}{tokenizer.eos_token}"
+            history += output_text
     except KeyboardInterrupt:
         return
 
