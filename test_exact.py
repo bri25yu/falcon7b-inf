@@ -79,7 +79,6 @@ def init_reimpl_model() -> Module:
     return RWForCausalLM.from_pretrained(
         model_name,
         torch_dtype=bfloat16,
-        trust_remote_code=True,
         device_map="auto",
     )
 
@@ -88,7 +87,6 @@ def init_reimpl_model_best_match() -> Module:
     return RWForCausalLM.from_pretrained(
         model_name,
         torch_dtype=bfloat16,
-        trust_remote_code=True,
         device_map="auto",
         use_cache=False,
         match_baseline_rotary=True,

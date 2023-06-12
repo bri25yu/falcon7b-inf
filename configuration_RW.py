@@ -66,6 +66,7 @@ class RWConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
 
         self.bos_token_id = bos_token_id
+        self.pad_token_id = eos_token_id
         self.eos_token_id = eos_token_id
         self.multi_query = multi_query
         self.alibi = alibi
