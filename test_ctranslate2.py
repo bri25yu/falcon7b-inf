@@ -85,3 +85,12 @@ def compare_ct2_hf_outputs(
         print(hf_output.output_text.removeprefix(input_text + "\n"), "\n")
     else:
         print("Ctranslate2 and HF model outputs match")
+
+
+if __name__ == "__main__":
+    ct2_output = run_ctranslate2()
+    hf_output = run_hf()
+    compare_ct2_hf_outputs(
+        ct2_output=ct2_output,
+        hf_output=hf_output,
+    )
