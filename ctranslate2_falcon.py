@@ -2,12 +2,11 @@ import argparse
 
 from ctranslate2.specs import common_spec, transformer_spec
 
-from ctranslate2.converters.transformers import Converter, RWLoader, TransformersConverter, register_loader
+from ctranslate2.converters.transformers import Converter, RWLoader, TransformersConverter
 
 from modeling_falcon import RWForCausalLM
 
 
-@register_loader("RWConfig")
 class FalconLoader(RWLoader):
     @property
     def architecture_name(self):
@@ -86,7 +85,7 @@ class FalconConverter(TransformersConverter):
             #         % (config_name, ", ".join(sorted(_MODEL_LOADERS.keys())))
             #     )
 
-            loader = FalconLoader
+            loader = FalconLoader()
 
             ####################
             # END Skip config to get loader. use falcon loader
