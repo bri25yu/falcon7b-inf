@@ -20,6 +20,11 @@ pip -q -q -q install -r requirements.txt
 deepspeed run.py
 ```
 
+## Using ctranslate2
+```bash
+python ctranslate2_falcon.py --model tiiuae/falcon-7b-instruct --quantization float16 --output_dir falcon-7b-instruct
+```
+
 ## Benchmarks
 Output from `test_exact.py` on a Google Colab A100 GPU with 40GB of GPU VRAM
 ```

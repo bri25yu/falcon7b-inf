@@ -1,14 +1,18 @@
-import os
-
 import argparse
 
 from ctranslate2.specs import common_spec, transformer_spec
 
-from ctranslate2.converters.transformers import _MODEL_LOADERS, Converter, RWLoader, TransformersConverter, register_loader
+from ctranslate2.converters.transformers import Converter, RWLoader, TransformersConverter, register_loader
+
+from modeling_falcon import RWForCausalLM
 
 
 @register_loader("RWConfig")
 class FalconLoader(RWLoader):
+    @property
+    def architecture_name(self):
+        return None  # This is never used in the downstream logic
+
     def get_model_spec(self, model):
         spec = transformer_spec.TransformerDecoderModelSpec.from_config(
             model.config.n_layer,
@@ -57,24 +61,36 @@ class FalconLoader(RWLoader):
 
 
 class FalconConverter(TransformersConverter):
+    # This is an exact copy of `TransformersConverter._load` unless specified otherwise
     def _load(self):
         import torch
         import transformers
 
         with torch.no_grad():
-            config = transformers.AutoConfig.from_pretrained(
-                self._model_name_or_path, trust_remote_code=self._trust_remote_code
-            )
+            ####################
+            # START Skip config to get loader. use falcon loader
+            ####################
 
-            config_name = config.__class__.__name__
-            loader = _MODEL_LOADERS.get(config_name)
+            # Original code:
+            # config = transformers.AutoConfig.from_pretrained(
+            #     self._model_name_or_path, trust_remote_code=self._trust_remote_code
+            # )
 
-            if loader is None:
-                raise ValueError(
-                    "No conversion is registered for the model configuration %s "
-                    "(supported configurations are: %s)"
-                    % (config_name, ", ".join(sorted(_MODEL_LOADERS.keys())))
-                )
+            # config_name = config.__class__.__name__
+            # loader = _MODEL_LOADERS.get(config_name)
+
+            # if loader is None:
+            #     raise ValueError(
+            #         "No conversion is registered for the model configuration %s "
+            #         "(supported configurations are: %s)"
+            #         % (config_name, ", ".join(sorted(_MODEL_LOADERS.keys())))
+            #     )
+
+            loader = FalconLoader
+
+            ####################
+            # END Skip config to get loader. use falcon loader
+            ####################
 
             model_class = getattr(transformers, loader.architecture_name)
             tokenizer_class = transformers.AutoTokenizer
@@ -111,28 +127,10 @@ class FalconConverter(TransformersConverter):
             return spec
 
     def load_model(self, model_class, model_name_or_path, **kwargs):
-        return model_class.from_pretrained(model_name_or_path, **kwargs)
-
-    def get_model_file(self, filename):
-        if os.path.isdir(self._model_name_or_path):
-            path = os.path.join(self._model_name_or_path, filename)
-        else:
-            import huggingface_hub
-
-            try:
-                path = huggingface_hub.hf_hub_download(
-                    repo_id=self._model_name_or_path, filename=filename
-                )
-            except huggingface_hub.utils.EntryNotFoundError:
-                path = None
-
-        if path is None or not os.path.isfile(path):
-            raise ValueError(
-                "File %s does not exist in model %s"
-                % (filename, self._model_name_or_path)
-            )
-
-        return path
+        return RWForCausalLM.from_pretrained(
+            model_name_or_path,
+            **kwargs,
+        )
 
 
 def main():
