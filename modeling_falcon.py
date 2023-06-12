@@ -199,7 +199,12 @@ class Attention(Module):
         key: NHLDkv = fused_qkv[:, :, -2 * Nkv: -Nkv, :].transpose(1, 2)
         value: NHLDkv = fused_qkv[:, :, -Nkv:, :].transpose(1, 2)
         # query, key = self.maybe_rotary(query, key, past_key_value_length)
+
+        query = query.view(-1, L, Dkv)
+        key = key.view(-1, L, Dkv)
         query, key = self.maybe_rotary(query, key)
+        query = query.view(N, H, L, Dkv)
+        key = key.view(N, H, L, Dkv)
 
         if using_past_key_values:  # Concatenate after relative positional encoding to not duplicate encoding
             key: NHLDkv = cat((past_key, key), dim=2)
