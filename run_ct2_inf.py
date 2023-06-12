@@ -56,15 +56,17 @@ def repl(
                 print("Goodbye!")
                 break
 
-            history += f"{human_input_token} {user_input} {ai_input_token} "
+            history += f"{human_input_token} {user_input}\n{ai_input_token} "
 
             inference_step_time = time()
             output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
             inference_step_time = time() - inference_step_time
 
+            output_text = output_text.split(human_input_token)[0]
+            output_text = output_text.strip("\n")
             print(f"\t{output_text}\n\t({inference_step_time:.1f}s)")
 
-            history += output_text
+            history += f"{output_text}\n"
     except KeyboardInterrupt:
         return
 
