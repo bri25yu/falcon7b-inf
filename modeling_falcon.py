@@ -66,6 +66,7 @@ class RotaryEmbedding(Module):
         # self.initialize_cos_sin(config.custom_max_length, config.torch_dtype)
 
     def initialize_cos_sin(self, L: int, dtype: torch_dtype) -> None:
+        # if self.seq_len_cached < L:
         if self.seq_len_cached != L:
             self.seq_len_cached = L
 
@@ -96,9 +97,9 @@ class RotaryEmbedding(Module):
         if past_key_value_length is not None:
             cos = cos[:, :, [L-1], :]
             sin = sin[:, :, [L-1], :]
-        # else:
-        #     cos = cos[:, :, :L, :]
-        #     sin = sin[:, :, :L, :]
+        else:
+            cos = cos[:, :, :L, :]
+            sin = sin[:, :, :L, :]
 
         return apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
 
