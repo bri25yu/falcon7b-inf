@@ -48,14 +48,17 @@ def repl(
     print(f"If you want to quit, please input \"{stop_word}\".\n\n")
 
     history = ""  # TODO This is heavily unoptimized
-    while True:
-        user_input = input()
-        if user_input == stop_word: break
+    try:
+        while True:
+            user_input = input()
+            if user_input == stop_word: break
 
-        history += f"{user_input}{tokenizer.eos_token}"
-        output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
-        print(output_text)
-        history += f"{output_text}{tokenizer.eos_token}"
+            history += f"{user_input}{tokenizer.eos_token}"
+            output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
+            print(output_text)
+            history += f"{output_text}{tokenizer.eos_token}"
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":
