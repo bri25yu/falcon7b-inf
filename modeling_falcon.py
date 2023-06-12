@@ -63,15 +63,16 @@ class RotaryEmbedding(Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self.seq_len_cached: int = 0
-        self.initialize_cos_sin(config.custom_max_length, config.torch_dtype)
+        self.initial_length_to_cache = config.custom_max_length
 
-    def initialize_cos_sin(self, L: int, dtype: torch_dtype) -> None:
+    def initialize_cos_sin(self, L: int, dtype: torch_dtype, device: torch_device) -> None:
+        L = max(L, self.initial_length_to_cache)
         if self.seq_len_cached < L:
             self.seq_len_cached = L
 
             t = arange(L).type_as(self.inv_freq)
             freqs: LHalfDkv = outer(t, self.inv_freq)
-            emb: LDkv = cat((freqs, freqs), dim=1)
+            emb: LDkv = cat((freqs, freqs), dim=1).to(device)
 
             if dtype in [float16, bfloat16]:
                 emb = emb.float()
@@ -82,15 +83,9 @@ class RotaryEmbedding(Module):
             self.cos_cached: _11LDkv = self.cos_cached.type(dtype)
             self.sin_cached: _11LDkv = self.sin_cached.type(dtype)
 
-    def move_cos_sin_devices(self, device: torch_device) -> None:
-        if device != self.cos_cached.device:
-            self.cos_cached = self.cos_cached.to(device)
-            self.sin_cached = self.sin_cached.to(device)
-
     def forward(self, query: NHLDkv, key: NHLDkv, past_key_value_length: Optional[int]=None) -> Tuple[NHLDkv, NHLDkv]:
         L = key.size(2) + (past_key_value_length if past_key_value_length is not None else 0)
-        self.initialize_cos_sin(L, query.dtype)
-        self.move_cos_sin_devices(query.device)
+        self.initialize_cos_sin(L, query.dtype, query.device)
 
         cos, sin = self.cos_cached, self.sin_cached
         if past_key_value_length is not None:
