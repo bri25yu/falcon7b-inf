@@ -2,7 +2,7 @@ from torch import allclose, bfloat16, no_grad, rand
 
 from transformers import set_seed
 
-from configuration_RW import RWConfig
+from configuration_falcon import FalconConfig
 from modeling_falcon import Attention, RotaryEmbedding
 
 
@@ -18,7 +18,7 @@ dummy_inputs = total_dummy_inputs[:, :-1, :]
 next_dummy_input = total_dummy_inputs[:, -1:, :].clone()
 
 with no_grad():
-    reimpl_config = RWConfig.from_pretrained(model_name, torch_dtype=dtype)
+    reimpl_config = FalconConfig.from_pretrained(model_name, torch_dtype=dtype)
     reimpl_rotary = RotaryEmbedding(reimpl_config).to(device)
     reimpl_attention = Attention(reimpl_config, reimpl_rotary).to(device)
     reimpl_attention.query_key_value.weight.normal_()

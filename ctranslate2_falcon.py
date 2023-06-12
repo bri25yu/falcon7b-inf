@@ -5,7 +5,7 @@ from torch import float16
 from ctranslate2.specs import common_spec, transformer_spec
 from ctranslate2.converters.transformers import Converter, RWLoader, TransformersConverter
 
-from modeling_falcon import RWForCausalLM, RWConfig
+from modeling_falcon import RWForCausalLM, FalconConfig
 
 
 class FalconLoader(RWLoader):
@@ -141,7 +141,7 @@ class FalconConverter(TransformersConverter):
             return spec
 
     def load_model(self, model_name_or_path, **kwargs):
-        config = RWConfig.from_pretrained(model_name_or_path, **kwargs)
+        config = FalconConfig.from_pretrained(model_name_or_path, **kwargs)
         assert config.torch_dtype == float16
         return RWForCausalLM.from_pretrained(
             model_name_or_path,

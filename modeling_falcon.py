@@ -17,7 +17,7 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
-from configuration_RW import RWConfig
+from configuration_falcon import FalconConfig
 
 
 logger = logging.get_logger(__name__)
@@ -64,7 +64,7 @@ def apply_rotary(embeds, cos, sin):
 
 
 class RotaryEmbedding(Module):
-    def __init__(self, config: RWConfig, base: float=10000) -> None:
+    def __init__(self, config: FalconConfig, base: float=10000) -> None:
         super().__init__()
 
         Dkv = config.head_dim
@@ -115,7 +115,7 @@ class RotaryEmbedding(Module):
 
 
 class Attention(Module):
-    def __init__(self, config: RWConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
+    def __init__(self, config: FalconConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
         super().__init__()
 
         D = config.hidden_size
@@ -179,7 +179,7 @@ class Attention(Module):
 
 
 class MLP(Module):
-    def __init__(self, config: RWConfig) -> None:
+    def __init__(self, config: FalconConfig) -> None:
         super().__init__()
 
         D, Dff = config.hidden_size, 4 * config.hidden_size
@@ -192,7 +192,7 @@ class MLP(Module):
 
 
 class DecoderLayer(Module):
-    def __init__(self, config: RWConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
+    def __init__(self, config: FalconConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
         super().__init__()
 
         self.config = config
@@ -219,7 +219,7 @@ class RWPreTrainedModel(PreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
     _keys_to_ignore_on_load_unexpected = [r"h.*.post_attention_layernorm"]
 
-    config_class = RWConfig
+    config_class = FalconConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
     _no_split_modules = ["DecoderLayer"]
@@ -237,7 +237,7 @@ class RWPreTrainedModel(PreTrainedModel):
 
 
 class RWModel(RWPreTrainedModel):
-    def __init__(self, config: RWConfig) -> None:
+    def __init__(self, config: FalconConfig) -> None:
         super().__init__(config)
 
         D = config.hidden_size
@@ -336,7 +336,7 @@ class RWModel(RWPreTrainedModel):
 class RWForCausalLM(RWPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
 
-    def __init__(self, config: RWConfig):
+    def __init__(self, config: FalconConfig):
         super().__init__(config)
         self.transformer = RWModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, dtype=config.torch_dtype)
