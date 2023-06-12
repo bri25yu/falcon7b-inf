@@ -37,8 +37,6 @@ def perform_generation(
 def repl(
     max_new_tokens_per_step: int=50,
     stop_word: str="STOP",
-    user_input_prefix: str="User:",
-    model_input_prefix: str="Assistant:",
 ) -> None:
     print("Initializing generation")
     init_time = time()
@@ -47,17 +45,17 @@ def repl(
     print(f"Initialization took {init_time:.1f}s")
 
     print("Starting chatbot...")
-    print(f"If you want to quit, please input \"{stop_word}\".")
+    print(f"If you want to quit, please input \"{stop_word}\".\n\n")
 
     history = ""  # TODO This is heavily unoptimized
     while True:
         user_input = input()
         if user_input == stop_word: break
 
-        history += f"{user_input_prefix} {user_input}"
+        history += f"{user_input}{tokenizer.eos_token}"
         output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
         print(output_text)
-        history += f"{model_input_prefix} {output_text}"
+        history += f"{output_text}{tokenizer.eos_token}"
 
 
 if __name__ == "__main__":
