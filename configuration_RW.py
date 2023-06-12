@@ -49,6 +49,7 @@ class RWConfig(PretrainedConfig):
         alibi=False,
         bias=False,
         parallel_attn=False,
+        match_baseline_rotary: bool=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -70,6 +71,9 @@ class RWConfig(PretrainedConfig):
         self.alibi = alibi
         self.bias = bias
         self.parallel_attn = parallel_attn
+
+        # TODO this is in place to match the baseline rotary embedding cache initialization
+        self.match_baseline_rotary = match_baseline_rotary
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 

@@ -63,7 +63,12 @@ class RotaryEmbedding(Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self.seq_len_cached: int = 0
-        self.initialize_cos_sin(config.custom_max_length, config.torch_dtype)
+        """
+        TODO I'm pretty sure this is more efficient, but for some reason it causes the implementation
+        to not match ://
+        """
+        if not config.match_baseline_rotary:
+            self.initialize_cos_sin(config.custom_max_length, config.torch_dtype)
 
     def initialize_cos_sin(self, L: int, dtype: torch_dtype) -> None:
         if self.seq_len_cached < L:
@@ -122,6 +127,17 @@ class Attention(Module):
         layer_past: Optional[Tuple[NHLDkv, NHLDkv]] = None,
         use_cache: bool = False,
     ) -> Tuple[NLD, Tuple[NHLDkv, NHLDkv]]:
+        """
+        TODO For some reason this attn mechanism doesn't exactly match the original falcon implementation
+        when using past key values. See `test_attention_pastkv.py`.
+        I've tried looking into:
+        - precision: bfloat16 vs float32. errors on both
+        - hardware: cuda vs cpu. errors on both
+        - slices/views doing weird things with mm/bmm. errors on both clones with new mem and views that share the same mem
+        - the three operations that are involved are the `self.query_key_value`, `scaled_dot_product_attention`, and `self.dense`
+            curious that all 3 ops involve addition/batching diffs.
+
+        """
         Dkv, Nkv, H = self.Dkv, self.Nkv, self.H
         N, L, _ = hidden_states.size()
 
@@ -149,8 +165,8 @@ class Attention(Module):
         attn_output: NHLDkv = scaled_dot_product_attention(query, key, value, is_causal=not using_past_key_values)
         attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
         attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
-        output_tensor: NLD = self.dense(attn_output)
-        return output_tensor, present
+        attn_output: NLD = self.dense(attn_output)
+        return attn_output, present
 
 
 class MLP(Module):
