@@ -38,14 +38,13 @@ def repl(
     max_new_tokens_per_step: int=50,
     stop_word: str="STOP",
 ) -> None:
-    print("Initializing generation")
+    print("Initializing generation...", end="")
     init_time = time()
     tokenizer, generator = initialize_generation()
     init_time = time() - init_time
-    print(f"Initialization took {init_time:.1f}s")
+    print(f"...took {init_time:.1f}s")
 
-    print("Starting chatbot...")
-    print(f"If you want to quit, please input \"{stop_word}\".\n\n")
+    print(f"Starting chatbot. If you want to quit, please input \"{stop_word}\".\n\n")
 
     history = ""  # TODO This is heavily unoptimized
     try:
