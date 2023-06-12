@@ -1,5 +1,9 @@
 from typing import Callable
 
+from os.path import exists
+
+import pickle
+
 from time import time
 
 from dataclasses import dataclass
@@ -79,22 +83,60 @@ def init_reimpl_model() -> Module:
         device_map="auto",
     )
 
-base_output = run_inference_on_model(init_base_model)
-reimpl_output = run_inference_on_model(init_reimpl_model)
 
-print(
-    "Init time",
-    f"\tBase model {base_output.init_time:.3f}s",
-    f"\tReimpl model {reimpl_output.init_time:.3f}s",
-    sep="\n",
-)
-print(
-    "Inference time",
-    f"\tBase model {base_output.inference_time:.3f}s",
-    f"\tReimpl model {reimpl_output.inference_time:.3f}s",
-    sep="\n",
-)
+def init_reimpl_model_best_match() -> Module:
+    return RWForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=bfloat16,
+        trust_remote_code=True,
+        device_map="auto",
+        use_cache=False,
+        match_baseline_rotary=True,
+    )
 
-if base_output.output_text != reimpl_output.output_text:
-    print("Base and reimpl model outputs do not match!")
-    print("Base model output", base_output.output_text, "Reimpl model output", reimpl_output.output_text, sep="\n\n")
+
+if __name__ == "__main__":
+    base_output_fname = "base_output.pkl"
+    if exists(base_output_fname):
+        with open(base_output_fname, "rb") as f:
+            base_output = pickle.load(f)
+    else:
+        base_output = run_inference_on_model(init_base_model)
+        with open(base_output_fname, "wb") as f:
+            pickle.dump(base_output, f)
+
+    reimpl_output = run_inference_on_model(init_reimpl_model)
+
+    reimpl_best_match_output = run_inference_on_model(init_reimpl_model_best_match)
+
+    print(
+        "Init time",
+        f"\tBase model {base_output.init_time:.3f}s",
+        f"\tReimpl best match model {reimpl_best_match_output.init_time:.3f}s",
+        f"\tReimpl model {reimpl_output.init_time:.3f}s",
+        sep="\n",
+    )
+    print(
+        "Inference time",
+        f"\tBase model {base_output.inference_time:.3f}s",
+        f"\tReimpl best match model {reimpl_best_match_output.inference_time:.3f}s",
+        f"\tReimpl model {reimpl_output.inference_time:.3f}s",
+        sep="\n",
+    )
+
+    if base_output.output_text != reimpl_best_match_output.output_text:
+        print("Base and reimpl best match model outputs do not match!")
+        print("Base model output")
+        print(base_output.output_text.removeprefix(input_text + "\n"), "\n")
+        print("Reimpl best match model output")
+        print(reimpl_best_match_output.output_text.removeprefix(input_text + "\n"), "\n")
+    else:
+        print("Base and reimpl best match model outputs match")
+
+    if base_output.output_text != reimpl_output.output_text:
+        print("Base model output")
+        print(base_output.output_text.removeprefix(input_text + "\n"), "\n")
+        print("Reimpl model output")
+        print(reimpl_output.output_text.removeprefix(input_text + "\n"), "\n")
+    else:
+        print("Base and reimpl model outputs match")
