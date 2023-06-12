@@ -92,7 +92,6 @@ class FalconConverter(TransformersConverter):
             # END Skip config to get loader. use falcon loader
             ####################
 
-            model_class = getattr(transformers, loader.architecture_name)
             tokenizer_class = transformers.AutoTokenizer
 
             kwargs = {}
@@ -105,7 +104,19 @@ class FalconConverter(TransformersConverter):
             if self._trust_remote_code:
                 kwargs["trust_remote_code"] = self._trust_remote_code
 
-            model = self.load_model(model_class, self._model_name_or_path, **kwargs)
+            ####################
+            # START ignore model_class
+            ####################
+
+            # Original code:
+            # model_class = getattr(transformers, loader.architecture_name)
+            # model = self.load_model(model_class, self._model_name_or_path, **kwargs)
+
+            model = self.load_model(self._model_name_or_path, **kwargs)
+
+            ####################
+            # END ignore model_class
+            ####################
 
             tokenizer = self.load_tokenizer(
                 tokenizer_class,
@@ -126,7 +137,7 @@ class FalconConverter(TransformersConverter):
 
             return spec
 
-    def load_model(self, model_class, model_name_or_path, **kwargs):
+    def load_model(self, model_name_or_path, **kwargs):
         return RWForCausalLM.from_pretrained(
             model_name_or_path,
             **kwargs,
