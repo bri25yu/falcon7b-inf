@@ -38,53 +38,49 @@ class RWConfig(PretrainedConfig):
         n_layer=2,
         n_head=8,
         layer_norm_epsilon=1e-5,
-        initializer_range=0.02,
         use_cache=True,
         bos_token_id=1,
         eos_token_id=2,
-        apply_residual_connection_post_layernorm=False,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        multi_query=False,
-        alibi=False,
-        bias=False,
-        parallel_attn=False,
         match_baseline_rotary: bool=False,
         **kwargs,
     ):
+        # Unused kwargs
+        kwargs_to_remove = [
+            "n_embed",  # Backward compatibility with n_embed kwarg
+            "apply_residual_connection_post_layernorm",  # default to false
+            "initializer_range",  # We apply no weight inits
+            "alibi",  # We default to rotary
+            "parallel_attn",  # Default to true
+            "bias",  # Default to false
+            "multi_query",  # Default to true
+            "hidden_dropout",  # Default to 0.0
+            "attention_dropout",  # Default to 0.0, never used
+        ]
+        for kwarg_to_remove in kwargs_to_remove:
+            if kwarg_to_remove in kwargs:
+                kwargs.pop(kwarg_to_remove)
+
         self.vocab_size = vocab_size
-        # Backward compatibility with n_embed kwarg
-        n_embed = kwargs.pop("n_embed", None)
-        self.hidden_size = hidden_size if n_embed is None else n_embed
+        self.hidden_size = hidden_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.layer_norm_epsilon = layer_norm_epsilon
-        self.initializer_range = initializer_range
         self.use_cache = use_cache
-        self.apply_residual_connection_post_layernorm = apply_residual_connection_post_layernorm
-        self.hidden_dropout = hidden_dropout
-        self.attention_dropout = attention_dropout
 
         self.bos_token_id = bos_token_id
         self.pad_token_id = eos_token_id
         self.eos_token_id = eos_token_id
-        self.multi_query = multi_query
-        self.alibi = alibi
-        self.bias = bias
-        self.parallel_attn = parallel_attn
 
         # TODO this is in place to match the baseline rotary embedding cache initialization
         self.match_baseline_rotary = match_baseline_rotary
 
-        super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
+        super().__init__(
+            bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=self.pad_token_id, **kwargs
+        )
 
     @property
     def head_dim(self):
         return self.hidden_size // self.n_head
-
-    @property
-    def rotary(self):
-        return not self.alibi
 
     @property
     def custom_max_length(self):

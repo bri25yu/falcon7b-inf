@@ -2,12 +2,12 @@
 This is a copy of https://huggingface.co/tiiuae/falcon-7b-instruct/blob/main/modelling_RW.py
 with some inference optimizations.
 """
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 from torchtyping import TensorType
 
-from torch import LongTensor, Tensor, arange, bfloat16, cat, device as torch_device, dtype as torch_dtype, empty, float16, outer
+from torch import LongTensor, Tensor, arange, bfloat16, cat, dtype as torch_dtype, empty, float16, outer
 from torch.nn import CrossEntropyLoss, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
-from torch.nn.functional import dropout, scaled_dot_product_attention, linear
+from torch.nn.functional import scaled_dot_product_attention, linear
 from torch.utils.checkpoint import checkpoint
 from torch.nn.utils import skip_init
 
@@ -32,6 +32,15 @@ NLD = TensorType["N", "L", "D"]
 _11LDkv = TensorType["1", "1", "L", "Dkv"]
 NHLDkv = TensorType["N", "H", "L", "Dkv"]
 NLHDkv = TensorType["N", "L", "H", "Dkv"]
+
+class PastKV(NamedTuple):
+    keys: NHLDkv
+    values: NHLDkv
+
+
+class ModelOutputWithPast(NamedTuple):
+    hidden_states: NLD
+    past_key_values: PastKV=None
 
 
 # Skip weight init since we are only run finetuning or inference
@@ -124,9 +133,9 @@ class Attention(Module):
     def forward(
         self,
         hidden_states: NLD,
-        layer_past: Optional[Tuple[NHLDkv, NHLDkv]] = None,
-        use_cache: bool = False,
-    ) -> Tuple[NLD, Tuple[NHLDkv, NHLDkv]]:
+        past_key_values: Optional[PastKV]=None,
+        use_cache: bool=False,
+    ) -> ModelOutputWithPast:
         """
         TODO For some reason this attn mechanism doesn't exactly match the original falcon implementation
         when using past key values. See `test_attention_pastkv.py`.
@@ -141,9 +150,9 @@ class Attention(Module):
         Dkv, Nkv, H = self.Dkv, self.Nkv, self.H
         N, L, _ = hidden_states.size()
 
-        if layer_past is not None:
+        if past_key_values is not None:
             using_past_key_values = True
-            past_key, past_value = layer_past
+            past_key, past_value = past_key_values
             past_key_value_length = past_key.size(2)
         else:
             using_past_key_values = False
@@ -166,98 +175,49 @@ class Attention(Module):
         attn_output: NLHDkv = attn_output.permute(0, 2, 1, 3)
         attn_output: NLD = attn_output.reshape(N, L, H * Dkv)
         attn_output: NLD = self.dense(attn_output)
-        return attn_output, present
+        return ModelOutputWithPast(attn_output, present)
 
 
 class MLP(Module):
-    def __init__(self, config: RWConfig):
+    def __init__(self, config: RWConfig) -> None:
         super().__init__()
-        hidden_size = config.hidden_size
 
-        self.dense_h_to_4h = Linear(hidden_size, 4 * hidden_size, dtype=config.torch_dtype)
+        D, Dff = config.hidden_size, 4 * config.hidden_size
+        self.dense_h_to_4h: DD = Linear(D, Dff, dtype=config.torch_dtype)
         self.act = GELU()
-        self.dense_4h_to_h = Linear(4 * hidden_size, hidden_size, dtype=config.torch_dtype)
-        self.hidden_dropout = config.hidden_dropout
+        self.dense_4h_to_h: DD = Linear(Dff, D, dtype=config.torch_dtype)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.act(self.dense_h_to_4h(x))
-        x = self.dense_4h_to_h(x)
-        return x
-
-
-def dropout_add(x: Tensor, residual: Tensor, prob: float, training: bool) -> Tensor:
-    out = dropout(x, p=prob, training=training)
-    out = residual + out
-    return out
+    def forward(self, hidden_states: NLD) -> NLD:
+        return self.dense_4h_to_h(self.act(self.dense_h_to_4h(hidden_states)))
 
 
 class DecoderLayer(Module):
     def __init__(self, config: RWConfig, shared_rotary_embeddings: RotaryEmbedding) -> None:
         super().__init__()
-        hidden_size = config.hidden_size
-
-        self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.num_heads = config.n_head
-        self.self_attention = Attention(config, shared_rotary_embeddings)
-
-        if not config.parallel_attn:
-            # unused if parallel attn
-            self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-
-        self.mlp = MLP(config)
-
-        self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
-        self.hidden_dropout = config.hidden_dropout
 
         self.config = config
+        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.self_attention = Attention(config, shared_rotary_embeddings)
+        self.mlp = MLP(config)
 
     def forward(
         self,
-        hidden_states: Tensor,
-        layer_past: Optional[Tuple[Tensor, Tensor]] = None,
-        use_cache: bool = False,
-    ):
-
-        layernorm_output = self.input_layernorm(hidden_states)
+        hidden_states: NLD,
+        past_key_values: Optional[PastKV]=None,
+        use_cache: bool=False,
+    ) -> ModelOutputWithPast:
         residual = hidden_states
+        layernorm_output = self.input_layernorm(hidden_states)
 
-        # Self attention.
-        attn_outputs = self.self_attention(
-            layernorm_output,
-            layer_past=layer_past,
-            use_cache=use_cache,
-        )
+        attention_output, present = self.self_attention(layernorm_output, past_key_values=past_key_values, use_cache=use_cache)
+        output = self.mlp(layernorm_output) + attention_output + residual # Add attention output for parallel attention
 
-        attention_output = attn_outputs[0]
-
-        if not self.config.parallel_attn:
-            residual = dropout_add(attention_output, residual, self.config.attention_dropout, training=self.training)
-            layernorm_output = self.post_attention_layernorm(residual)
-
-        outputs = attn_outputs[1:]
-
-        # MLP.
-        mlp_output = self.mlp(layernorm_output)
-
-        if self.config.parallel_attn:
-            mlp_output += attention_output
-
-        output = dropout_add(mlp_output, residual, self.config.hidden_dropout, training=self.training)
-
-        if use_cache:
-            outputs = (output,) + outputs
-        else:
-            outputs = (output,) + outputs[1:]
-
-        return outputs  # hidden_states, present, attentions
+        return ModelOutputWithPast(output, present)
 
 
 class RWPreTrainedModel(PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"h.*.self_attention.scale_mask_softmax.causal_mask", r"lm_head.weight"]
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
-    """
+    _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
+    _keys_to_ignore_on_load_unexpected = [r"h.*.post_attention_layernorm"]
 
     config_class = RWConfig
     base_model_prefix = "transformer"
@@ -311,14 +271,12 @@ class RWModel(RWPreTrainedModel):
         inputs_embeds: Optional[LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -341,7 +299,6 @@ class RWModel(RWPreTrainedModel):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-
                 if use_cache:
                     logger.warning(
                         "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -362,7 +319,7 @@ class RWModel(RWPreTrainedModel):
             else:
                 outputs = block(
                     hidden_states,
-                    layer_past=layer_past,
+                    past_key_values=layer_past,
                     use_cache=use_cache,
                 )
 
@@ -375,9 +332,6 @@ class RWModel(RWPreTrainedModel):
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, presents, all_hidden_states] if v is not None)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
@@ -427,7 +381,6 @@ class RWForCausalLM(RWPreTrainedModel):
         labels: Optional[Tensor] = None,
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[Tensor], CausalLMOutputWithCrossAttentions]:
         r"""
@@ -436,15 +389,12 @@ class RWForCausalLM(RWPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
         hidden_states = transformer_outputs[0]
 
@@ -461,10 +411,6 @@ class RWForCausalLM(RWPreTrainedModel):
             loss = loss_fct(
                 shift_logits.view(batch_size * seq_length, vocab_size), shift_labels.view(batch_size * seq_length)
             )
-
-        if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
