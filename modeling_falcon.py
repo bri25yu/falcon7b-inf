@@ -6,10 +6,12 @@ from typing import NamedTuple, Optional, Tuple, Union
 from torchtyping import TensorType
 
 from torch import LongTensor, Tensor, arange, bfloat16, cat, dtype as torch_dtype, empty, float16, outer
-from torch.nn import CrossEntropyLoss, Embedding, GELU, LayerNorm, Module, ModuleList, Parameter
+from torch.nn import CrossEntropyLoss, Embedding, GELU, Module, ModuleList, Parameter
 from torch.nn.functional import scaled_dot_product_attention, linear
 from torch.utils.checkpoint import checkpoint
 from torch.nn.utils import skip_init
+
+from apex.normalization import FusedLayerNorm
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -196,7 +198,7 @@ class DecoderLayer(Module):
         super().__init__()
 
         self.config = config
-        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.input_layernorm = FusedLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.self_attention = Attention(config, shared_rotary_embeddings)
         self.mlp = MLP(config)
 
@@ -237,21 +239,14 @@ class RWPreTrainedModel(PreTrainedModel):
 
 
 class RWModel(RWPreTrainedModel):
-    def __init__(self, config: RWConfig):
+    def __init__(self, config: RWConfig) -> None:
         super().__init__(config)
 
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.n_head
-
-        # Embedding + LN Embedding
-        self.word_embeddings = skip_init(Embedding, config.vocab_size, self.embed_dim)
-
-        # Transformer blocks
+        D = config.hidden_size
+        self.word_embeddings = skip_init(Embedding, config.vocab_size, D)
         shared_rotary_embeddings = RotaryEmbedding(config)
         self.h = ModuleList([DecoderLayer(config, shared_rotary_embeddings) for _ in range(config.num_hidden_layers)])
-
-        # Final Layer Norm
-        self.ln_f = skip_init(LayerNorm, self.embed_dim, eps=config.layer_norm_epsilon)
+        self.ln_f = skip_init(FusedLayerNorm, D, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
 

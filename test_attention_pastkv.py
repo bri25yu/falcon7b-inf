@@ -27,7 +27,7 @@ with no_grad():
     _, past_key_values = reimpl_attention(dummy_inputs, use_cache=True)
 
     next_base_outputs, next_base_past_key_values = reimpl_attention(total_dummy_inputs, use_cache=True)
-    next_reimpl_output, next_reimpl_past_key_values = reimpl_attention(next_dummy_input, use_cache=True, layer_past=past_key_values)
+    next_reimpl_output, next_reimpl_past_key_values = reimpl_attention(next_dummy_input, use_cache=True, past_key_values=past_key_values)
 
 assert allclose(next_base_past_key_values[0][:, :, :-1, :], next_reimpl_past_key_values[0][:, :, :-1, :])  # Passes?
 assert allclose(next_base_past_key_values[1][:, :, :-1, :], next_reimpl_past_key_values[1][:, :, :-1, :])  # Passes?
