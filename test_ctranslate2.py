@@ -1,4 +1,4 @@
-import ctranslate2
+from ctranslate2 import Generator
 
 from test_exact import *
 
@@ -7,13 +7,13 @@ def run_ctranslate2() -> BenchmarkOutput:
     generator_name = model_name.split("/")[-1]
 
     init_time = time()
-    generator = ctranslate2.Generator(generator_name, device="cuda")
+    generator = Generator(generator_name, device="cuda")
     init_time = time() - init_time
 
     tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(input_text))
 
     inference_time = time()
-    results = generator.generate_batch([tokens], beam_size=1, max_length=max_new_tokens)
+    results = generator.generate_batch([tokens], beam_size=1, max_length=max_new_tokens, include_prompt_in_result=False)
     inference_time = time() - inference_time
     output_text = tokenizer.decode(results[0].sequences_ids[0])
 
