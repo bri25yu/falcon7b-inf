@@ -204,7 +204,7 @@ class Attention(Module):
         key = key.view(-1, L, Dkv)
         query, key = self.maybe_rotary(query, key)
         query = query.view(N, H, L, Dkv)
-        key = key.view(N, H, L, Dkv)
+        key = key.view(N, Nkv, L, Dkv)
 
         if using_past_key_values:  # Concatenate after relative positional encoding to not duplicate encoding
             key: NHLDkv = cat((past_key, key), dim=2)
