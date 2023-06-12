@@ -129,15 +129,21 @@ def compare_outputs(
         print("Base and reimpl model outputs match")
 
 
+def load_or_run(model_init: Callable[[], Module], output_fname: str, run: bool=False) -> BenchmarkOutput:
+    if not run and exists(output_fname):
+        with open(output_fname, "rb") as f:
+            output = pickle.load(f)
+    else:
+        output = run_inference_on_model(model_init)
+        with open(output_fname, "wb") as f:
+            pickle.dump(output, f)
+
+    return output
+
+
 if __name__ == "__main__":
     base_output_fname = "base_output.pkl"
-    if exists(base_output_fname):
-        with open(base_output_fname, "rb") as f:
-            base_output = pickle.load(f)
-    else:
-        base_output = run_inference_on_model(init_base_model)
-        with open(base_output_fname, "wb") as f:
-            pickle.dump(base_output, f)
+    base_output = load_or_run(init_base_model, base_output_fname)
 
     reimpl_output = run_inference_on_model(init_reimpl_model)
     reimpl_best_match_output = run_inference_on_model(init_reimpl_model_best_match)
