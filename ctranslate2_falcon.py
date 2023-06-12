@@ -13,6 +13,9 @@ class FalconLoader(RWLoader):
     def architecture_name(self):
         return None  # This is never used in the downstream logic
 
+    def set_linear(self, spec, module):
+        spec.weight = module.weight.numpy()
+
     def get_model_spec(self, model):
         spec = transformer_spec.TransformerDecoderModelSpec.from_config(
             model.config.n_layer,
