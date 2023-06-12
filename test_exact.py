@@ -121,6 +121,7 @@ def compare_outputs(
         print("Base and reimpl best match model outputs match")
 
     if base_output.output_text != reimpl_output.output_text:
+        print("Base and reimpl model outputs do not match!")
         print("Base model output")
         print(base_output.output_text.removeprefix(input_text + "\n"), "\n")
         print("Reimpl model output")
