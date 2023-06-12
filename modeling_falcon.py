@@ -63,10 +63,9 @@ class RotaryEmbedding(Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         self.seq_len_cached: int = 0
-        self.initial_length_to_cache = config.custom_max_length
+        self.initialize_cos_sin(config.custom_max_length, config.torch_dtype)
 
-    def initialize_cos_sin(self, L: int, dtype: torch_dtype, device: torch_device) -> None:
-        L = max(L, self.initial_length_to_cache)
+    def initialize_cos_sin(self, L: int, dtype: torch_dtype) -> None:
         if self.seq_len_cached < L:
             self.seq_len_cached = L
 
@@ -85,7 +84,10 @@ class RotaryEmbedding(Module):
 
     def forward(self, query: NHLDkv, key: NHLDkv, past_key_value_length: Optional[int]=None) -> Tuple[NHLDkv, NHLDkv]:
         L = key.size(2) + (past_key_value_length if past_key_value_length is not None else 0)
-        self.initialize_cos_sin(L, query.dtype, query.device)
+        self.initialize_cos_sin(L, query.dtype)
+        if query.device != self.cos_cached.device:
+            self.cos_cached = self.cos_cached.to(query.device)
+            self.sin_cached = self.sin_cached.to(query.device)
 
         cos, sin = self.cos_cached, self.sin_cached
         if past_key_value_length is not None:
@@ -136,7 +138,7 @@ class Attention(Module):
         query: NHLDkv = fused_qkv[:, :, :-2 * Nkv, :].transpose(1, 2)
         key: NHLDkv = fused_qkv[:, :, -2 * Nkv: -Nkv, :].transpose(1, 2)
         value: NHLDkv = fused_qkv[:, :, -Nkv:, :].transpose(1, 2)
-        query, key = self.maybe_rotary(query, key, past_key_value_length)
+        query, key = self.rotary(query, key, past_key_value_length)
 
         if using_past_key_values:  # Concatenate after relative positional encoding to not duplicate encoding
             key: NHLDkv = cat((past_key, key), dim=2)
