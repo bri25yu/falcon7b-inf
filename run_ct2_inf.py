@@ -54,8 +54,13 @@ def repl(
             if user_input == stop_word: break
 
             history += f"{user_input}{tokenizer.eos_token}"
+
+            inference_step_time = time()
             output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
-            print(output_text)
+            inference_step_time = time() - inference_step_time
+
+            print(f"\t{output_text}\n\t({inference_step_time:.1f}s)")
+
             history += f"{output_text}{tokenizer.eos_token}"
     except KeyboardInterrupt:
         return
