@@ -246,7 +246,7 @@ class RWModel(RWPreTrainedModel):
         self.word_embeddings = skip_init(Embedding, config.vocab_size, D)
         shared_rotary_embeddings = RotaryEmbedding(config)
         self.h = ModuleList([DecoderLayer(config, shared_rotary_embeddings) for _ in range(config.num_hidden_layers)])
-        self.ln_f = skip_init(FusedLayerNorm, D, eps=config.layer_norm_epsilon)
+        self.ln_f = FusedLayerNorm(D, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
 
