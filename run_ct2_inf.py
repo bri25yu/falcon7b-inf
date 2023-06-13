@@ -26,19 +26,20 @@ def initialize_generation() -> Tuple[PreTrainedTokenizer, Generator]:
 
 def perform_generation(
     tokenizer: PreTrainedTokenizer, generator: Generator, input_text: str, max_new_tokens_per_step: int
-) -> str:
+) -> Tuple[str, int]:
     tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(input_text))
     results = generator.generate_batch([tokens], beam_size=1, max_length=max_new_tokens_per_step, include_prompt_in_result=False)
-    output_text = tokenizer.decode(results[0].sequences_ids[0])
+    output_ids = results[0].sequences_ids[0]
+    output_text = tokenizer.decode(output_ids)
 
-    return output_text
+    return output_text, len(output_ids)
 
 
 def repl(
-    max_new_tokens_per_step: int=50,
+    max_new_tokens_per_step: int=100,
     stop_word: str="STOP",
-    human_input_token: str="[|Human|]",
-    ai_input_token: str="[|AI|]",
+    user_input_token: str="User",
+    falcon_input_token: str="Falcon",
 ) -> None:
     print("Initializing generation...", end=" ")
     init_time = time()
@@ -48,7 +49,8 @@ def repl(
 
     print(f"Starting chatbot. If you want to quit, please input \"{stop_word}\".\n\n")
 
-    history = "The conversation between human and AI assistant."  # TODO This is heavily unoptimized
+    # TODO This is heavily unoptimized
+    history = f"The following is a conversation between a highly knowledgeable and intelligent AI assistant, called {falcon_input_token}, and a human user, called {user_input_token}. In the following interactions, {user_input_token} and {falcon_input_token} will converse in natural language, and {falcon_input_token} will answer {user_input_token}'s questions. {falcon_input_token} was built to be respectful, polite and inclusive. {falcon_input_token} was built by the Technology Innovation Institute in Abu Dhabi. {falcon_input_token} will never decline to answer a question, and always attempts to give an answer that {user_input_token} would be satisfied with. It knows a lot, and always tells the truth. The conversation begins."
     try:
         while True:
             user_input = input()
@@ -56,18 +58,22 @@ def repl(
                 print("Goodbye!")
                 break
 
-            history += f"{human_input_token} {user_input}\n{ai_input_token} "
+            history += f"{user_input_token} {user_input} {falcon_input_token}"
 
             inference_step_time = time()
-            output_text = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
+            output_text, num_output_tokens = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
             inference_step_time = time() - inference_step_time
 
-            output_text = output_text.split(human_input_token)[0]
-            output_text = output_text.strip("\n")
-            print(f"\t{output_text}\n\t({inference_step_time:.1f}s)")
+            num_output_user_input_tokens = output_text.count(user_input_token)
+            if num_output_user_input_tokens > 1:
+                raise ValueError(f"Too many instances ({num_output_user_input_tokens}) of {user_input_token} found in text!")
 
-            history += f"{output_text}\n"
+            output_text = output_text.removesuffix(user_input_token)
+            print(f"\t{output_text}\n\t({inference_step_time:.1f}s, {num_output_tokens} tokens)")
+
+            history += f"{output_text}"
     except KeyboardInterrupt:
+        print("Goodbye!")
         return
 
 
