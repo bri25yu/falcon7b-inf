@@ -32,7 +32,9 @@ def perform_generation(
     output_ids = results[0].sequences_ids[0]
     output_text = tokenizer.decode(output_ids)
 
-    return output_text, len(output_ids)
+    total_num_ids = len(tokens) + len(output_ids)
+
+    return output_text, total_num_ids
 
 
 def repl(
@@ -49,7 +51,7 @@ def repl(
 
     print(f"Starting chatbot. If you want to quit, please input \"{stop_word}\".\n\n")
 
-    # TODO This is heavily unoptimized
+    # TODO This is heavily unoptimized. Prompt is from https://huggingface.co/spaces/HuggingFaceH4/falcon-chat
     history = f"The following is a conversation between a highly knowledgeable and intelligent AI assistant, called {falcon_input_token}, and a human user, called {user_input_token}. In the following interactions, {user_input_token} and {falcon_input_token} will converse in natural language, and {falcon_input_token} will answer {user_input_token}'s questions. {falcon_input_token} was built to be respectful, polite and inclusive. {falcon_input_token} was built by the Technology Innovation Institute in Abu Dhabi. {falcon_input_token} will never decline to answer a question, and always attempts to give an answer that {user_input_token} would be satisfied with. It knows a lot, and always tells the truth. The conversation begins."
     try:
         while True:
@@ -58,20 +60,17 @@ def repl(
                 print("Goodbye!")
                 break
 
-            history += f"{user_input_token} {user_input} {falcon_input_token}"
+            history += f"{user_input_token} {user_input} {falcon_input_token} "
 
             inference_step_time = time()
             output_text, num_output_tokens = perform_generation(tokenizer, generator, history, max_new_tokens_per_step)
             inference_step_time = time() - inference_step_time
 
-            num_output_user_input_tokens = output_text.count(user_input_token)
-            if num_output_user_input_tokens > 1:
-                raise ValueError(f"Too many instances ({num_output_user_input_tokens}) of {user_input_token} found in text!")
-
-            output_text = output_text.removesuffix(user_input_token)
+            output_text = output_text.split(user_input_token)[0]
+            output_text = output_text.strip().removesuffix(user_input_token)
             print(f"\t{output_text}\n\t({inference_step_time:.1f}s, {num_output_tokens} tokens)")
 
-            history += f"{output_text}"
+            history += output_text
     except KeyboardInterrupt:
         print("Goodbye!")
         return
